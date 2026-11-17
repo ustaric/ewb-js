@@ -1,0 +1,47 @@
+{
+  "name": "ewb-js",
+  "version": "0.0.1",
+  "description": "Modern HTML5 EPUB Web Engine with independent iframe isolation, triple-slot 0ms transitions, and Mod/HookBus plugin architecture",
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./bridge/FoliateCompatView": "./bridge/FoliateCompatView.js",
+    "./bridge/FoliateCompatView.js": "./bridge/FoliateCompatView.js",
+    "./core/*": "./core/*.js",
+    "./layout/*": "./layout/*.js",
+    "./parser/*": "./parser/*.js",
+    "./utils/*": "./utils/*.js",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": [
+    "./bridge/FoliateCompatView.js"
+  ],
+  "files": [
+    "index.js",
+    "core/",
+    "layout/",
+    "parser/",
+    "bridge/",
+    "utils/",
+    "README.md",
+    "API.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "epub",
+    "ebook",
+    "reader",
+    "html5",
+    "epub-viewer",
+    "cfi",
+    "esm",
+    "ewb-js"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "fflate": "^0.8.3"
+  }
+}
