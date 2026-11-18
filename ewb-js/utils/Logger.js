@@ -3,6 +3,7 @@
  * - 🔌 [제로 외부 의존성] 특정 앱의 debugManager를 직접 import하지 않고 adapter 옵션으로 주입받아 동작
  * - 📋 [4대 컨텍스트 표준] Caller/Trigger, Lifecycle/State, Delta/Metrics, Result/Handoff 포맷 헬퍼(trace) 제공
  * - 🛡️ [다형성 안전 가드] trace(scope, ctx)와 trace(ctx) 호출 모두 정상 처리해 [object Object] 오출력 방지
+ * - 📂 [그룹/접힘 지원] group(중요 상세 펼침) / groupCollapsed(프리로드 등 연속 로그 접힘) 분리 지원
  * 파일 경로: web/ewb-js/utils/Logger.js
  * @module ewb-js/utils/Logger
  */
@@ -52,6 +53,14 @@ export class EngineLogger {
     clearHistory() { this._history.length = 0; }
 
     /**
+     * 현재 디버그(trace/group) 로그 출력이 활성화되어 있는지 확인합니다.
+     * @returns {boolean}
+     */
+    isDebugEnabled() {
+        return this._shouldLog('debug');
+    }
+
+    /**
      * 모듈별 스코프 태그가 고정된 하위 로거를 생성합니다.
      * @param {string} scope
      */
@@ -69,7 +78,9 @@ export class EngineLogger {
                     this.trace(safeScope, ctxOrAction || {});
                 }
             },
+            isDebugEnabled: () => this._shouldLog('debug'),
             group: (title) => this.group(`[${this.namespace}:${safeScope}] ${title}`),
+            groupCollapsed: (title) => this.groupCollapsed(`[${this.namespace}:${safeScope}] ${title}`),
             groupEnd: () => this.groupEnd()
         };
     }
@@ -117,7 +128,30 @@ export class EngineLogger {
                 else this.adapter.group(title);
                 return;
             }
-            if (typeof console.groupCollapsed === 'function') console.groupCollapsed(title);
+            if (typeof console.group === 'function') console.group(title);
+        } catch (e) {}
+    }
+
+    /**
+     * 접힌(Collapsed) 콘솔 그룹을 시작합니다.
+     * @param {string} title
+     */
+    groupCollapsed(title) {
+        if (!this._shouldLog('debug')) return;
+        try {
+            if (this.adapter && typeof this.adapter.groupCollapsed === 'function') {
+                if (this._usesChannelFirst()) this.adapter.groupCollapsed(this.defaultChannel, title);
+                else this.adapter.groupCollapsed(title);
+                return;
+            }
+            if (typeof console.groupCollapsed === 'function') {
+                console.groupCollapsed(title);
+                return;
+            }
+            if (this.adapter && typeof this.adapter.group === 'function') {
+                if (this._usesChannelFirst()) this.adapter.group(this.defaultChannel, title);
+                else this.adapter.group(title);
+            }
         } catch (e) {}
     }
 

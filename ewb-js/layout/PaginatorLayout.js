@@ -1,7 +1,7 @@
 /**
  * 📐 HTML5 표준 다단(CSS Multi-column) & 세로 페이지 스냅 조판 레이아웃 엔진 (PaginatorLayout)
  * - 📖 [가로/세로 통합] paginated(가로 다단) 및 scrolled(세로 페이지/부드러운 스크롤) 단일 코어 지원
- * - 📏 [정수배 Spacer 마감] 세로 끝 여백 실측 보정 및 2단 홀수 컬럼 끝 여백 보정으로 마지막 페이지 혼재 차단
+ * - 📏 [정수배 Spacer 마감] 세로 끝 여백 실측 보정(실제 본문 끝 좌표 검증 포함) 및 2단 홀수 컬럼 끝 여백 보정으로 마지막 빈 페이지 차단
  * - ✂️ [상단 잘림 & 빈 줄 스냅] scrolled 모드 이동/끝점 진입 시 상단 걸침 줄 및 소형 빈 줄을 첫 텍스트 줄에 정렬
  * - 🎯 [Range/앵커 즉시 점프] CFI Range 및 #id 앵커의 실측 좌표를 기반으로 목표 페이지/스크롤 위치 즉시 이동
  * - 🔌 [외부 스타일/훅 친화] 코어 조판 스타일(<style id="ewb-core-layout-style">)과 사용자 오버라이드를 분리 유지
@@ -35,6 +35,7 @@ export class PaginatorLayout {
         this.transition = 'instant';
         this._skipLeadingBlankLines = true;
         this._scrollEndTimer = null;
+        this._actualContentBottom = 0;
     }
 
     /**
@@ -68,8 +69,8 @@ export class PaginatorLayout {
             action: 'applyLayout',
             caller: 'PaginatorLayout',
             state: this.flow,
-            delta: `viewport=${m.usableWidth}x${m.usableHeight}px, margins(T:${m.paddingTop} B:${m.paddingBottom} L:${m.paddingLeft} R:${m.paddingRight}), box=${m.contentWidth}x${m.pageHeight}px (${m.fullLineCount}L×${m.exactLineHeightPx}px), ${m.columnCount}col(w:${m.columnWidth}/gap:${m.columnGap})`,
-            result: `pages=${pagination.totalPages}, step=${pagination.stepSize}px`
+            delta: `viewport=${m.usableWidth}x${m.usableHeight}px, margins(T:${m.paddingTop} B:${m.paddingBottom} L:${m.paddingLeft} R:${m.paddingRight}), box=${m.contentWidth}x${m.pageHeight}px (${m.fullLineCount}L×${m.exactLineHeightPx}px), ${m.columnCount}col(w:${m.columnWidth}/gap:${m.columnGap}), textBottom=${this._actualContentBottom}px`,
+            result: `pages=${pagination.totalPages}, step=${pagination.stepSize}px, maxScroll=${pagination.maxScrollPos}px`
         });
 
         return {
@@ -196,8 +197,74 @@ export class PaginatorLayout {
     }
 
     /**
+     * 문서 본문 내 실제 비공백 텍스트 및 미디어 요소의 문서 절대 최하단 좌표(px)를 실측합니다.
+     * - Range/getBoundingClientRect는 뷰포트 상대 좌표이므로 현재 scrollTop을 더해 문서 절대 좌표로 환산합니다.
+     * - [data-ewb-end-spacer="true"] 요소는 측정 대상에서 제외합니다.
+     * @returns {number} 실제 본문 최하단 문서 좌표 (px, 내용물 없음 시 0)
+     * @private
+     */
+    _measureActualContentBottom() {
+        const body = this.doc?.body;
+        if (!body) return 0;
+
+        const scroller = this.getScrollElement();
+        const scrollTop = scroller ? (scroller.scrollTop || 0) : 0;
+        const win = this.doc.defaultView;
+        const nodeFilter = win?.NodeFilter || NodeFilter;
+        let maxBottom = 0;
+
+        try {
+            const walker = this.doc.createTreeWalker(body, nodeFilter.SHOW_TEXT, {
+                acceptNode: (n) => {
+                    const parent = n.parentElement;
+                    if (!parent) return nodeFilter.FILTER_REJECT;
+                    if (parent.closest?.(`[${END_SPACER_ATTR}="true"]`)) {
+                        return nodeFilter.FILTER_REJECT;
+                    }
+                    const tag = parent.tagName.toLowerCase();
+                    if (tag === 'script' || tag === 'style' || tag === 'noscript') {
+                        return nodeFilter.FILTER_REJECT;
+                    }
+                    return n.nodeValue && n.nodeValue.replace(/[\s\u00A0\u3000\r\n\t]/g, '').length > 0
+                        ? nodeFilter.FILTER_ACCEPT
+                        : nodeFilter.FILTER_SKIP;
+                }
+            });
+
+            let textNode;
+            const range = this.doc.createRange();
+            try {
+                while ((textNode = walker.nextNode())) {
+                    range.selectNodeContents(textNode);
+                    const rects = range.getClientRects();
+                    for (const r of rects) {
+                        if (r.width > 0 && r.height > 0) {
+                            const absBottom = r.bottom + scrollTop;
+                            if (absBottom > maxBottom) maxBottom = absBottom;
+                        }
+                    }
+                }
+            } finally {
+                range.detach();
+            }
+
+            const mediaList = body.querySelectorAll('img, svg, video, canvas');
+            for (const media of mediaList) {
+                if (media.closest?.(`[${END_SPACER_ATTR}="true"]`)) continue;
+                const mRect = media.getBoundingClientRect();
+                if (mRect.width > 0 && mRect.height > 0) {
+                    const absBottom = mRect.bottom + scrollTop;
+                    if (absBottom > maxBottom) maxBottom = absBottom;
+                }
+            }
+        } catch (e) {}
+
+        return Number(maxBottom.toFixed(2));
+    }
+
+    /**
      * 챕터 마지막 페이지가 화면 정수배로 딱 떨어지도록 끝 여백(Spacer)을 확정합니다.
-     * - scrolled 모드: 삽입 후 scrollHeight를 재측정해 문단 하단 마진 붕괴 해제분까지 보정
+     * - scrolled 모드: 실제 텍스트/미디어 끝 좌표(actualContentBottom) 기준으로 유령 빈 페이지 생성을 차단하고 정수배 스페이서만 적용
      * - paginated 2단 모드: 홀수 컬럼 마감 시 빈 오른쪽 컬럼 1칸을 보충해 마지막 페이지 겹침 차단
      */
     ensureEndSpacer() {
@@ -212,31 +279,83 @@ export class PaginatorLayout {
             const scroller = this.getScrollElement();
             const pageH = this.metrics.pageHeight;
             const rawContentH = Math.max(body.scrollHeight, root.scrollHeight);
+            const actualContentBottom = this._measureActualContentBottom();
+            this._actualContentBottom = actualContentBottom;
+
+            const textEndPage = actualContentBottom > 0
+                ? Math.max(1, Math.ceil((actualContentBottom - 1) / pageH))
+                : 1;
+            const docEndPage = Math.max(1, Math.ceil((rawContentH - 1) / pageH));
+            const maxAllowedTotalH = textEndPage * pageH;
+
             const remainder = rawContentH % pageH;
-            const neededSpacer = remainder > 1 ? Math.max(0, pageH - remainder) : 0;
+            let neededSpacer = remainder > 1 ? Math.max(0, pageH - remainder) : 0;
+            let ghostPageBlocked = false;
 
-            const spacer = this.doc.createElement('div');
-            spacer.setAttribute(END_SPACER_ATTR, 'true');
-            spacer.setAttribute('aria-hidden', 'true');
-            const initialH = neededSpacer > 0 ? neededSpacer : 1;
-            spacer.style.cssText = `height: ${initialH}px !important; width: 100% !important; margin: 0 !important; padding: 0 !important; pointer-events: none !important;`;
-            body.appendChild(spacer);
+            // 꼬리 공백/여백으로 본문 끝 페이지를 이미 넘겼거나 상한에 도달한 경우 유령 빈 페이지 스페이서 차단
+            if (actualContentBottom > 0 && (docEndPage > textEndPage || rawContentH >= maxAllowedTotalH - 1)) {
+                neededSpacer = 0;
+                ghostPageBlocked = docEndPage > textEndPage;
+            }
 
-            if (scroller) {
-                const actualH = Math.max(pageH, scroller.scrollHeight);
-                const excess = actualH % pageH;
-                if (neededSpacer === 0 && excess <= 1) {
-                    spacer.remove();
-                } else if (excess > 1 && excess < pageH - 1) {
-                    if (initialH > excess) {
-                        const corrected = Math.max(1, Math.round(initialH - excess));
-                        spacer.style.setProperty('height', `${corrected}px`, 'important');
+            let finalSpacerH = 0;
+            if (neededSpacer > 0) {
+                const spacer = this.doc.createElement('div');
+                spacer.setAttribute(END_SPACER_ATTR, 'true');
+                spacer.setAttribute('aria-hidden', 'true');
+                spacer.style.cssText = `height: ${neededSpacer}px !important; width: 100% !important; margin: 0 !important; padding: 0 !important; pointer-events: none !important;`;
+                body.appendChild(spacer);
+                finalSpacerH = neededSpacer;
+
+                if (scroller) {
+                    const actualH = Math.max(pageH, scroller.scrollHeight);
+                    if (actualContentBottom > 0 && actualH > maxAllowedTotalH + 1) {
+                        const overBy = actualH - maxAllowedTotalH;
+                        if (neededSpacer > overBy) {
+                            finalSpacerH = Math.max(0, Math.round(neededSpacer - overBy));
+                            if (finalSpacerH > 0) {
+                                spacer.style.setProperty('height', `${finalSpacerH}px`, 'important');
+                            } else {
+                                spacer.remove();
+                            }
+                        } else {
+                            spacer.remove();
+                            finalSpacerH = 0;
+                            ghostPageBlocked = true;
+                        }
                     } else {
-                        const added = Math.ceil(pageH - excess);
-                        spacer.style.setProperty('height', `${initialH + added}px`, 'important');
+                        const excess = actualH % pageH;
+                        if (excess > 1 && excess < pageH - 1) {
+                            if (neededSpacer > excess) {
+                                finalSpacerH = Math.max(1, Math.round(neededSpacer - excess));
+                                spacer.style.setProperty('height', `${finalSpacerH}px`, 'important');
+                            } else {
+                                const added = Math.ceil(pageH - excess);
+                                const candidateH = neededSpacer + added;
+                                if (actualContentBottom > 0 && (rawContentH + candidateH) > maxAllowedTotalH + 1) {
+                                    spacer.remove();
+                                    finalSpacerH = 0;
+                                    ghostPageBlocked = true;
+                                } else {
+                                    finalSpacerH = candidateH;
+                                    spacer.style.setProperty('height', `${finalSpacerH}px`, 'important');
+                                }
+                            }
+                        }
                     }
                 }
             }
+
+            const postScrollH = scroller ? scroller.scrollHeight : Math.max(body.scrollHeight, root.scrollHeight);
+            this.logger?.trace?.({
+                action: 'ensureEndSpacer',
+                caller: 'PaginatorLayout:scrolled',
+                state: this.flow,
+                delta: `pageH=${pageH}px, rawH=${rawContentH}px(${docEndPage}p), textBottom=${actualContentBottom}px(${textEndPage}p), needed=${neededSpacer}px -> finalSpacer=${finalSpacerH}px, postScrollH=${postScrollH}px`,
+                result: ghostPageBlocked
+                    ? 'ghost_page_blocked(0px)'
+                    : (finalSpacerH > 0 ? 'spacer_applied' : 'no_spacer_needed')
+            });
             return;
         }
 
@@ -261,7 +380,21 @@ export class PaginatorLayout {
                     const afterTotalPages = Math.max(1, Math.ceil((afterScrollW + gap - 4) / stepSize));
                     if (afterTotalPages > rawTotalPages) {
                         colSpacer.remove();
+                        this.logger?.trace?.({
+                            action: 'ensureEndSpacer',
+                            caller: 'PaginatorLayout:paginated2Col',
+                            state: this.flow,
+                            delta: `rawW=${rawScrollW}px(${rawTotalPages}p) -> afterW=${afterScrollW}px(${afterTotalPages}p), deficit=${deficit.toFixed(1)}px`,
+                            result: 'col_spacer_reverted(page_overflow)'
+                        });
                     } else {
+                        this.logger?.trace?.({
+                            action: 'ensureEndSpacer',
+                            caller: 'PaginatorLayout:paginated2Col',
+                            state: this.flow,
+                            delta: `rawW=${rawScrollW}px(${rawTotalPages}p), deficit=${deficit.toFixed(1)}px`,
+                            result: 'col_spacer_applied'
+                        });
                         return;
                     }
                 }
@@ -433,10 +566,19 @@ export class PaginatorLayout {
 
         const stepSize = Math.max(100, this.metrics.pageHeight);
         const scrollH = Math.max(stepSize, scroller.scrollHeight);
-        const totalPages = Math.max(1, Math.ceil((scrollH - 2) / stepSize));
+        const contentBottom = this._actualContentBottom > 0 ? this._actualContentBottom : 0;
+        const maxAllowedTotalH = contentBottom > 0
+            ? Math.max(stepSize, Math.ceil((contentBottom - 1) / stepSize) * stepSize)
+            : scrollH;
+        const effectiveScrollH = Math.min(scrollH, maxAllowedTotalH);
+        const totalPages = Math.max(1, Math.ceil((effectiveScrollH - 2) / stepSize));
         const scrollPos = Math.max(0, scroller.scrollTop || 0);
-        const maxScrollPos = Math.max(0, scrollH - stepSize);
-        const currentPage = Math.min(totalPages - 1, Math.max(0, Math.round(scrollPos / stepSize)));
+        const maxScrollPos = Math.max(0, effectiveScrollH - stepSize);
+        const atContentEnd = contentBottom > 0 && (scrollPos + stepSize >= contentBottom - 0.5);
+        const atEnd = scrollPos >= maxScrollPos - 2 || atContentEnd;
+        const currentPage = atContentEnd
+            ? totalPages - 1
+            : Math.min(totalPages - 1, Math.max(0, Math.round(scrollPos / stepSize)));
 
         return {
             currentPage,
@@ -445,7 +587,7 @@ export class PaginatorLayout {
             scrollPos,
             maxScrollPos,
             atStart: scrollPos <= 1,
-            atEnd: scrollPos >= maxScrollPos - 2
+            atEnd
         };
     }
 
@@ -469,6 +611,14 @@ export class PaginatorLayout {
         } else {
             scroller.scrollTo({ top: targetPos, behavior: scrollBehavior });
         }
+
+        this.logger?.trace?.({
+            action: 'goToPage',
+            caller: 'PaginatorLayout',
+            state: this.flow,
+            delta: `reqPage=${pageIndex} -> targetPage=${clampedPage + 1}/${stats.totalPages}, pos=${targetPos}px (prevPos=${stats.scrollPos.toFixed(1)}px)`,
+            result: `scrollBehavior=${scrollBehavior}`
+        });
 
         return {
             moved: true,
@@ -550,6 +700,13 @@ export class PaginatorLayout {
     nextPage(options = {}) {
         const stats = this.getPaginationMetrics();
         if (stats.atEnd) {
+            this.logger?.trace?.({
+                action: 'nextPage',
+                caller: 'PaginatorLayout',
+                state: this.flow,
+                delta: `page=${stats.currentPage + 1}/${stats.totalPages}, pos=${stats.scrollPos.toFixed(1)}/${stats.maxScrollPos.toFixed(1)}px, textBottom=${this._actualContentBottom}px`,
+                result: 'atBoundary=end (chapter_handoff)'
+            });
             return {
                 moved: false,
                 atBoundary: 'end',
@@ -566,6 +723,7 @@ export class PaginatorLayout {
         }
 
         let delta = Number(options.distance || 0);
+        let snapReason = 'explicit_distance';
         if (delta <= 0) {
             if (options.lineSnap !== false && this.metrics) {
                 const snap = calculateScrolledLineSnapDelta(
@@ -575,8 +733,10 @@ export class PaginatorLayout {
                     this.metrics.exactLineHeightPx
                 );
                 delta = snap.distance;
+                snapReason = snap.reason;
             } else {
                 delta = stats.stepSize;
+                snapReason = 'step_size';
             }
         }
 
@@ -586,9 +746,33 @@ export class PaginatorLayout {
             ? this._alignScrolledTargetTop('next', baseNextTop, stats.scrollPos, stats.maxScrollPos)
             : baseNextTop;
 
+        // 보정 후에도 사실상 0px 이동이라면 챕터 경계로 인계하여 헛페이지 정체 차단
+        if (nextTop <= stats.scrollPos + 1) {
+            this.logger?.trace?.({
+                action: 'nextPage',
+                caller: 'PaginatorLayout',
+                state: this.flow,
+                delta: `pos=${stats.scrollPos.toFixed(1)} -> nextTop=${nextTop.toFixed(1)} (delta<=1px), max=${stats.maxScrollPos.toFixed(1)}px, textBottom=${this._actualContentBottom}px`,
+                result: 'atBoundary=end (zero_move_guard)'
+            });
+            return {
+                moved: false,
+                atBoundary: 'end',
+                currentPage: stats.currentPage,
+                totalPages: stats.totalPages
+            };
+        }
+
         scroller.scrollTo({ top: nextTop, behavior: behavior === 'smooth' ? 'smooth' : 'instant' });
 
         const updated = this.getPaginationMetrics();
+        this.logger?.trace?.({
+            action: 'nextPage',
+            caller: 'PaginatorLayout',
+            state: this.flow,
+            delta: `pos=${stats.scrollPos.toFixed(1)} -> ${nextTop.toFixed(1)}px (+${(nextTop - stats.scrollPos).toFixed(1)}px, reason=${snapReason}), max=${stats.maxScrollPos.toFixed(1)}px, textBottom=${this._actualContentBottom}px`,
+            result: `moved page=${updated.currentPage + 1}/${updated.totalPages}`
+        });
         return {
             moved: true,
             atBoundary: null,
@@ -608,6 +792,13 @@ export class PaginatorLayout {
     prevPage(options = {}) {
         const stats = this.getPaginationMetrics();
         if (stats.atStart) {
+            this.logger?.trace?.({
+                action: 'prevPage',
+                caller: 'PaginatorLayout',
+                state: this.flow,
+                delta: `page=${stats.currentPage + 1}/${stats.totalPages}, pos=${stats.scrollPos.toFixed(1)}px`,
+                result: 'atBoundary=start (chapter_handoff)'
+            });
             return {
                 moved: false,
                 atBoundary: 'start',
@@ -624,6 +815,7 @@ export class PaginatorLayout {
         }
 
         let delta = Number(options.distance || 0);
+        let snapReason = 'explicit_distance';
         if (delta <= 0) {
             if (options.lineSnap !== false && this.metrics) {
                 const snap = calculateScrolledLineSnapDelta(
@@ -633,8 +825,10 @@ export class PaginatorLayout {
                     this.metrics.exactLineHeightPx
                 );
                 delta = snap.distance;
+                snapReason = snap.reason;
             } else {
                 delta = stats.stepSize;
+                snapReason = 'step_size';
             }
         }
 
@@ -647,6 +841,13 @@ export class PaginatorLayout {
         scroller.scrollTo({ top: prevTop, behavior: behavior === 'smooth' ? 'smooth' : 'instant' });
 
         const updated = this.getPaginationMetrics();
+        this.logger?.trace?.({
+            action: 'prevPage',
+            caller: 'PaginatorLayout',
+            state: this.flow,
+            delta: `pos=${stats.scrollPos.toFixed(1)} -> ${prevTop.toFixed(1)}px (${(prevTop - stats.scrollPos).toFixed(1)}px, reason=${snapReason}), max=${stats.maxScrollPos.toFixed(1)}px`,
+            result: `moved page=${updated.currentPage + 1}/${updated.totalPages}`
+        });
         return {
             moved: true,
             atBoundary: null,
@@ -729,6 +930,7 @@ export class PaginatorLayout {
             clearTimeout(this._scrollEndTimer);
             this._scrollEndTimer = null;
         }
+        this._actualContentBottom = 0;
         this.doc = null;
         this.metrics = null;
     }

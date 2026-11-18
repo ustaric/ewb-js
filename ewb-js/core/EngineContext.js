@@ -3,6 +3,7 @@
  * - 🔌 [단일 창구] 외부 모드가 코어 내부를 직접 건드리지 않고 표준 API와 HookBus에만 의존하도록 격리
  * - 🧩 [API 레지스트리] registerApi / getApi로 추후 기능 확장 시 공식 API를 안전하게 추가·공유
  * - 🎨 [테마 & 컨테이너 개방] setTheme/getTheme 및 getContainer() 제공으로 외부 테마/HUD 모드 구현 지원
+ * - 🔬 [순수 관측·비교 API] getLayoutSnapshot() 및 measurePureBaseline() 제공으로 코어 조판 비간섭 비교 계측 지원
  * - 📐 [개방형 좌표/프레임/CFI/잘림 계측] 가시 라인 측정, 잘림 실측, 검색, CFI 코덱, 슬롯 순회 및 추적형 ChapterFrame 팩토리 개방
  * 파일 경로: web/ewb-js/core/EngineContext.js
  * @module ewb-js/core/EngineContext
@@ -214,6 +215,110 @@ export class EngineContext {
      */
     getClippingMetrics() {
         return this._engine?.getClippingMetrics?.() || null;
+    }
+
+    /**
+     * 지정 프레임(기본: 현재 활성 프레임)의 조판·스타일·물리 치수 스냅샷 복사본을 조회합니다.
+     * @param {ChapterFrame|null} [frame=this.getCurrentFrame()]
+     * @param {Object} [options={}]
+     * @param {boolean} [options.forceCapture=false] - true면 캐시를 무시하고 즉시 새로 계측
+     * @returns {{ initial: Object|null, last: Object|null }|null}
+     */
+    getLayoutSnapshot(frame = this.getCurrentFrame(), options = {}) {
+        if (!frame || frame.isDestroyed || typeof frame.getLayoutSnapshot !== 'function') {
+            return null;
+        }
+        return frame.getLayoutSnapshot(options);
+    }
+
+    /**
+     * HookBus(플러그인), userCss, themeCss를 전혀 개입시키지 않은 순수 엔진 기준(Baseline)으로
+     * 지정 챕터를 백그라운드에서 1회 실측한 뒤 프레임을 즉시 파괴하여 비교 기준 데이터를 반환합니다.
+     * @param {number} spineIndex - 실측할 챕터 인덱스
+     * @param {Object} [pureLayoutOptions={}] - 보정 전 원시 margins({ top, bottom, left, right }) 등 순수 레이아웃 옵션
+     * @returns {Promise<{
+     *   spineIndex: number,
+     *   snapshot: { initial: Object|null, last: Object|null }|null,
+     *   metrics: Object|null,
+     *   clipping: Object|null,
+     *   viewportMetrics: Object|null,
+     *   layoutOptions: Object
+     * }|null>}
+     */
+    async measurePureBaseline(spineIndex, pureLayoutOptions = {}) {
+        if (!this._engine || this._engine._isDestroyed) return null;
+
+        const sections = this.getSections();
+        if (!Array.isArray(sections) || sections.length === 0) return null;
+
+        const targetSpine = Math.min(Math.max(0, Number(spineIndex) || 0), sections.length - 1);
+        const href = sections[targetSpine]?.href || '';
+
+        const baseOptions = this.getLayoutOptions() || {};
+        const { margins, slotMode, ...restPure } = pureLayoutOptions || {};
+        const mergedOptions = {
+            ...baseOptions,
+            ...restPure,
+            backgroundColor: 'transparent'
+        };
+        delete mergedOptions.slotMode;
+
+        if (margins && typeof margins === 'object') {
+            if (margins.top !== undefined) mergedOptions.marginTop = Number(margins.top);
+            if (margins.bottom !== undefined) mergedOptions.marginBottom = Number(margins.bottom);
+            if (margins.left !== undefined) mergedOptions.marginLeft = Number(margins.left);
+            if (margins.right !== undefined) mergedOptions.marginRight = Number(margins.right);
+        }
+
+        const baselineFrame = new ChapterFrame({
+            spineIndex: targetSpine,
+            href,
+            container: this._engine.container,
+            hookBus: null,
+            logger: null,
+            isBaseline: true
+        });
+        this._engine._trackExternalFrame?.(baselineFrame);
+
+        try {
+            await baselineFrame.mount({
+                htmlSource: () => this.loadChapterHtml(targetSpine),
+                layoutOptions: mergedOptions,
+                userCss: '',
+                active: false,
+                initialPosition: 'start'
+            });
+
+            if (baselineFrame.isDestroyed || this._engine._isDestroyed) {
+                return null;
+            }
+
+            const snapshot = baselineFrame.getLayoutSnapshot({ forceCapture: true });
+            const metrics = baselineFrame.getMetrics();
+            const clipping = baselineFrame.getClippingMetrics();
+            const viewportMetrics = baselineFrame.paginator?.metrics
+                ? { ...baselineFrame.paginator.metrics }
+                : null;
+
+            return {
+                spineIndex: targetSpine,
+                snapshot,
+                metrics,
+                clipping,
+                viewportMetrics,
+                layoutOptions: mergedOptions
+            };
+        } catch (err) {
+            this._logger?.warn?.(`[EngineContext:measurePureBaseline] 순수 기준 측정 예외 (spine:${targetSpine}):`, err);
+            return null;
+        } finally {
+            try {
+                if (!baselineFrame.isDestroyed) baselineFrame.destroy();
+            } catch (e) {}
+            try {
+                this._engine?._externalFrames?.delete?.(baselineFrame);
+            } catch (e) {}
+        }
     }
 
     getVisibleLines(options = {}) {

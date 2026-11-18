@@ -22,13 +22,13 @@
       │     │     └── ChapterFrame (독립 iframe · PaginatorLayout · ViewportSnap)
       │     ├── HookBus (11대 라이프사이클 훅 중계소)
       │     └── EngineContext (Mod 전용 공식 API 집합소 + registerApi 레지스트리)
-      └── engine.use(mod) / engine.unuse(mod)
+      └── engine.use(mod) / engine.unuse(mod) / createEpubEngine({ mods, ... })
 
 ---
 
 ## 2. 빠른 시작
 
-    import { EwbEngine, createLogger } from './ewb-js/index.js';
+    import { EwbEngine, createEpubEngine, createLogger } from './ewb-js/index.js';
 
     const engine = new EwbEngine({
         container: document.getElementById('viewer-host'),
@@ -45,6 +45,9 @@
             linkColor: '#2563eb'
         }
     });
+
+    // 또는 mods 배열을 포함한 원라인 팩토리 사용
+    // const engine = createEpubEngine({ container, mods: [MyMod], ...options });
 
     engine.on('relocate', ({ detail }) => {
         console.log(detail.spineIndex, detail.page + 1, detail.totalPages, detail.cfi);
@@ -71,7 +74,7 @@
 | `backgroundColor` | `string` | `'transparent'` | 기본 외곽/프레임 배경색 |
 | `theme` | `ThemeObject \| null` | `null` | 초기 색상 테마 (`backgroundColor`, `textColor`, `linkColor`, `selectionColor`) |
 | `userCss` | `string` | `''` | 사용자 폰트·문단 간격 등 커스텀 CSS |
-| `logger` | `Object \| null` | `null` | `createLogger(...)` 인스턴스 또는 옵션 객체 (`{ adapter, defaultChannel }` 지원) |
+| `logger` | `Object \| null` | `null` | `createLogger(...)` 인스턴스 또는 옵션 객체 (`{ adapter, defaultChannel, level, enabled, namespace, channelMode, historyLimit }` 지원) |
 | `parser` | `Object \| null` | `EpubParser` | 커스텀 파서 주입 (선택) |
 | `cfiCodec` | `Object \| null` | `CfiCodec` | 커스텀 CFI 코덱 주입 (선택) |
 
@@ -94,6 +97,7 @@
 ## 5. `EwbEngine` 공개 메서드
 
 ### 5.1 라이프사이클 & 플러그인
+* `createEpubEngine({ container, mods = [], ...engineOptions })`: 엔진 생성과 동시에 초기 `mods` 배열을 일괄 장착하는 팩토리 함수 (`ewb-js/index.js` 공개 export).
 * `await engine.open(source, { initialLocation = 0, autoMount = true })`: EPUB `File`/`Blob`/`ArrayBuffer` 또는 파싱된 `Book` 객체를 엽니다.
 * `engine.use(mod)`: 함수형 `(ctx) => teardown?` 또는 객체형 `{ name, setup(ctx), teardown? }` 플러그인을 장착합니다. (`async setup` 및 중복 설치 방지 지원)
 * `engine.unuse(modOrName)`: 특정 플러그인을 이름 또는 참조로 즉시 해제합니다.
@@ -125,7 +129,7 @@
 * `await engine.loadChapterHtml(spineIndex)`: 리소스 해석 완료 HTML 문자열 반환.
 * `engine.getCurrentLocation()`: 현재 위치 스냅샷 반환.
 * `engine.getViewportMetrics()`: 조판 메트릭스(`usableWidth`, `usableHeight`, `pageHeight`, `contentWidth`, `columnCount`, `columnWidth`, `columnGap`, `paddingTop/Bottom/Left/Right`, `exactLineHeightPx`, `fullLineCount`) 반환.
-* `engine.getClippingMetrics()`: 현재 화면 잘림 및 라인·문단 실측치 반환 (`topCutPx`, `rawBottomCutPx`, `maskedBottomPx`, `visibleBottomCutPx`, `visibleLineCount`, `fullLineCount`, `paragraphCount`).
+* `engine.getClippingMetrics()`: 현재 화면 잘림 및 라인·문단 실측치 반환 (`topCutPx`, `rawBottomCutPx`, `maskedBottomPx`, `visibleBottomCutPx`, `topClippedCount`, `bottomClippedCount`, `visibleLineCount`, `fullLineCount`, `paragraphCount`, `topClippedText`, `bottomClippedText`, `pageHeight`).
 * `engine.getCurrentFrame()` / `engine.getFrames()` / `engine.forEachFrame(cb)` / `engine.getActiveDocument()`
 * `engine.encodeCfi(spineIndex, range, doc)` / `engine.decodeCfi(cfiString)` / `engine.resolveCfi(cfiString, doc, { collapseToStart = true })`
 * `for await (const hit of engine.search(query))`: 전체 책 본문 비동기 검색 제너레이터 (`{ spineIndex, cfi, excerpt }`).
@@ -173,8 +177,12 @@
 * `ctx.registerApi(namespace, apiObject)` / `ctx.getApi(namespace)` / `ctx.listApis()`
 * `ctx.getState()`
 * `ctx.getVisibleLines(options)` / `ctx.getFirstVisibleLine(options)` / `ctx.getLastVisibleLine(options)`
+* `ctx.getLayoutSnapshot(frame = ctx.getCurrentFrame(), { forceCapture = false })`: 지정 프레임의 순수 조판·스타일·물리 치수 스냅샷 `{ initial, last }` 읽기 전용 복사본 반환 (`ewb` 로거 비활성 상태에서도 즉시 실측 가능)
+* `await ctx.measurePureBaseline(spineIndex, pureLayoutOptions = {})`: `HookBus`(플러그인)·`userCss`·`themeCss`를 전혀 개입시키지 않은 순수 코어 기준 프레임(`isBaseline: true`)을 백그라운드에서 1회 실측 후 즉시 파기해 `{ spineIndex, snapshot, metrics, clipping, viewportMetrics, layoutOptions }` 반환
 * `ctx.createChapterFrame(spineIndex)`: 독립 프레임 생성 (엔진이 추적해 `engine.destroy()` 시 자동 정리)
 * `ctx.createLogger(scopeName)`
+
+> **참고 (`ChapterFrame` 읽기 전용 계측 메서드)**: `ctx.getCurrentFrame()` 또는 `onFrameReady`의 `frame` 객체에서는 `frame.isActive`, `frame.isDestroyed`, `frame.isBaseline`, `frame.getMetrics()`, `frame.getClippingMetrics()`, `frame.getLayoutSnapshot({ forceCapture })`, `frame.getVisibleLines(options)`, `frame.getFirstVisibleLine(options)`, `frame.getLastVisibleLine(options)`를 직접 조회할 수 있습니다.
 
 ### 7.3 라이프사이클 훅 (`HookBus`)
 
@@ -216,8 +224,9 @@
 
 ## 9. 변경 이력 (Changelog)
 
-* **2026-04 (로거·슬롯 추적 & 조판 진단 통일 & Mod 수칙 보강)**
-  * **호스트 로거 채널 연동**: `new EwbEngine({ logger: { adapter: debugManager, defaultChannel: 'ewb' } })` 구성을 통해 `EngineLogger`가 앱 디버그 채널(`ewb`)과 자동 연동되도록 연결(디버그 모달 `ewb` 채널 제어 지원).
-  * **`SlotController` 유휴 프리로드 및 슬롯 상태 추적 보강**: `setSlotMode`, `mountChapter`, `moveChapter`, `_promoteSlot`, `scheduleAdjacentPreload`(`requestIdleCallback(1200ms)` 예약 및 `runPreload` 실행/완료/실패), `destroy` 전 구간에 `scope: 'SlotController'` 4대 컨텍스트 `trace` 로그 추가.
-  * **조판 진단 기준 EWB 공개 API 통일**: `ewbDiagnosticsPlugin`에 `frame.isActive` 가드를 추가해 프리로드 슬롯(`active=false`)의 활성 진단 덮어쓰기를 차단하고, `layoutDiagnostics`·`readerSettingsApplier`가 `getViewportMetrics()`, `getClippingMetrics()`, `frame.getMetrics()` 스냅샷 기준으로 출력하도록 개선.
-  * **문서 보강**: `7.4 플러그인(Mod) 작성 필수 수칙` 및 변경 이력 추가.
+* **2026-11 (순수 조판 스냅샷·Baseline 비교 API & 추적 리포터 & `scrolled` 경계 정밀화)**
+  * **`EngineContext` 순수 관측 & Baseline 비교 API 신설**: `ctx.getLayoutSnapshot(frame, { forceCapture })`로 로거 비활성 상태에서도 조판 스냅샷(`initial` / `last`)을 조회할 수 있으며, `ctx.measurePureBaseline(spineIndex, pureLayoutOptions)`로 훅·`userCss`·`themeCss` 개입 없는 순수 기준 프레임(`isBaseline: true`)을 백그라운드 실측·파기해 비교 기준 데이터를 제공.
+  * **조판 스냅샷 리포터(`LayoutTraceReporter`) 및 로거 그룹 제어**: 마운트·재조판 중 `PaginatorLayout` 로그를 버퍼링해 활성 프레임은 요약 + 펼친 `group` + 접힌 중간 로그로, 프리로드 프레임(`active=false`)은 단일 `groupCollapsed`로 동기 출력. `EngineLogger`에 `isDebugEnabled()`, `groupCollapsed()`, `trace()` 다형성 가드 추가.
+  * **`PaginatorLayout` 본문 끝 실측 & 상단 스냅 보강**: `_measureActualContentBottom()` 실측으로 `scrolled` 꼬리 공백 유령 빈 페이지 차단(`ghost_page_blocked`), `goToEnd()` 상단 걸침 줄 스냅(`goToEndSnap`), `nextPage()` 0px 정체 방지(`zero_move_guard`) 및 `_emitRelocate()`의 `pageView` 정밀 추적 로그 통합.
+  * **호스트 로거 채널 연동 & `SlotController` 추적**: `new EwbEngine({ logger: { adapter: debugManager, defaultChannel: 'ewb' } })` 채널 연동 및 `SlotController` 유휴 프리로드/슬롯 승격 `trace` 로그 탑재.
+  * **문서 보강**: `createEpubEngine` 팩토리, `getClippingMetrics()` 전체 필드, `EngineContext` 신규 API, `7.4 플러그인(Mod) 작성 필수 수칙` 반영.

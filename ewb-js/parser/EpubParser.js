@@ -124,6 +124,11 @@ export class EpubParser {
                 resolver
             }));
 
+            const disposeBookResources = () => {
+                resolver.dispose();
+                zip.dispose();
+            };
+
             const book = {
                 isEwbBook: true,
                 opfPath,
@@ -155,10 +160,12 @@ export class EpubParser {
                 /**
                  * 책과 관련된 모든 ZIP 버퍼 및 Blob URL 자원을 일괄 해제합니다.
                  */
-                destroy: () => {
-                    resolver.dispose();
-                    zip.dispose();
-                }
+                dispose: disposeBookResources,
+
+                /**
+                 * 책과 관련된 모든 ZIP 버퍼 및 Blob URL 자원을 일괄 해제합니다. (하위 호환 별칭)
+                 */
+                destroy: disposeBookResources
             };
 
             const elapsed = (performance.now() - t0).toFixed(1);
@@ -551,6 +558,39 @@ export class EpubParser {
             return doc;
         };
 
+        /**
+         * 내부 리소스(이미지, 스타일시트 등)가 Blob URL로 치환된 HTML/XHTML 문자열을 반환합니다.
+         * @returns {Promise<string>}
+         */
+        const loadResolvedHtml = async () => {
+            const html = await loadHtml();
+            const doc = parseXmlOrHtml(html, 'application/xhtml+xml');
+            const { rewrittenCount } = resolver.resolveDocumentResources(doc, item.href);
+
+            this._log?.trace?.({
+                action: '섹션 리소스 Blob URL 치환',
+                caller: 'EpubParser.loadResolvedHtml',
+                state: `spine=${index}, contentType=${doc.contentType || 'unknown'}`,
+                delta: `rewritten=${rewrittenCount}`,
+                result: item.href
+            });
+
+            if (!doc || !doc.documentElement) {
+                return html;
+            }
+
+            if (doc.contentType === 'application/xhtml+xml') {
+                const serialized = new XMLSerializer().serializeToString(doc);
+                const hasXhtmlMarker = /^\s*(<\?xml|<!DOCTYPE\s+html[^>]*XHTML)/i.test(serialized)
+                    || serialized.includes('http://www.w3.org/1999/xhtml');
+                return hasXhtmlMarker
+                    ? serialized
+                    : `<?xml version="1.0" encoding="utf-8"?>\n${serialized}`;
+            }
+
+            return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`;
+        };
+
         return {
             index,
             id: item.id,
@@ -560,6 +600,7 @@ export class EpubParser {
             linear: item.linear,
             cfiBase,
             loadHtml,
+            loadResolvedHtml,
             load: loadHtml,
             createDocument,
             createURI: () => item.href

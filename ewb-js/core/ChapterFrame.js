@@ -3,6 +3,8 @@
  * - 🏛️ [상태 머신] IDLE ➔ MOUNTING ➔ RENDERING ➔ READY ➔ DESTROYED
  * - ⚡ [사전 완결 대기] HTML 주입, 훅, 스타일, 웹폰트, 이미지, Spacer까지 100% 끝난 readyPromise 제공
  * - 🎨 [테마 계층 분리] 코어 조판(#ewb-core-layout-style) / 사용자 스타일(#ewb-user-style) / 테마(#ewb-theme-style) 독립 주입
+ * - 🔬 [순수 조판 추적] 1차(폰트·정착 전) ➔ 최종 조판·relayout 스냅샷 비교 및 활성/프리로드 그룹 분리 출력
+ * - 📐 [스냅샷 관측 API] getLayoutSnapshot()으로 ewb 로거 OFF 상태에서도 현재 조판 스냅샷 읽기 전용 제공
  * - 🔬 [잘림·문단 계측 & 하단 마스킹] getClippingMetrics() 및 scrolled 모드 하단 걸침 줄 clip-path 보정 제공
  * - 🔗 [내부 앵커 중계] 문서 내 <a href> 클릭 시 onLinkClick 훅 발행으로 커스텀/기본 내비게이션 연동
  * - 🛡️ [CFI 무결성 보존] 각 챕터가 독립 iframe Document를 유지해 DOM 트리가 합쳐지지 않음
@@ -18,6 +20,11 @@ import {
     getFirstVisibleLine,
     getLastVisibleLine
 } from '../layout/ViewportSnap.js';
+import {
+    captureLayoutSnapshot,
+    createBufferedLayoutLogger,
+    emitPureLayoutReport
+} from '../utils/LayoutTraceReporter.js';
 
 export const FrameState = {
     IDLE: 'IDLE',
@@ -53,6 +60,23 @@ function waitTwoFrames(win = window) {
 }
 
 /**
+ * 조판 스냅샷 객체를 읽기 전용 반환용으로 안전 복사합니다.
+ * @param {Object|null} snapshot
+ * @returns {Object|null}
+ */
+function cloneLayoutSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return null;
+    return {
+        ...snapshot,
+        metrics: snapshot.metrics ? { ...snapshot.metrics } : null,
+        pagination: snapshot.pagination ? { ...snapshot.pagination } : null,
+        styles: snapshot.styles ? { ...snapshot.styles } : null,
+        dom: snapshot.dom ? { ...snapshot.dom } : null,
+        clipping: snapshot.clipping ? { ...snapshot.clipping } : null
+    };
+}
+
+/**
  * 단일 챕터(spineIndex)의 iframe 렌더링과 조판을 소유하는 독립 클래스
  */
 export class ChapterFrame {
@@ -63,13 +87,15 @@ export class ChapterFrame {
      * @param {HTMLElement} options.container - 마운트할 부모 DOM 컨테이너
      * @param {Object|null} [options.hookBus=null] - HookBus 중계소 인스턴스
      * @param {Object|null} [options.logger=null] - EngineLogger 또는 child 로거
+     * @param {boolean} [options.isBaseline=false] - 순수 엔진 Baseline 계측용 임시 프레임 여부
      */
-    constructor({ spineIndex, href = '', container, hookBus = null, logger = null } = {}) {
+    constructor({ spineIndex, href = '', container, hookBus = null, logger = null, isBaseline = false } = {}) {
         this.spineIndex = Number(spineIndex ?? 0);
         this.href = href;
         this.container = container;
         this.hookBus = hookBus;
         this.logger = logger;
+        this.isBaseline = Boolean(isBaseline);
 
         this.state = FrameState.IDLE;
         this.isActive = false;
@@ -90,6 +116,11 @@ export class ChapterFrame {
         this._themeCss = '';
         this._lastLayoutOptions = {};
         this._maskedBottomPx = 0;
+
+        this._isMountingPipeline = false;
+        this._layoutLogChannel = null;
+        this._initialLayoutSnapshot = null;
+        this._lastLayoutSnapshot = null;
     }
 
     /**
@@ -181,9 +212,18 @@ export class ChapterFrame {
                 if (!this._isValidMount(token)) return this;
             }
 
-            // 5. 1차 레이아웃 조판
-            this.paginator = new PaginatorLayout(this.doc, { logger: this.logger });
+            // 5. 1차 레이아웃 조판 (웹폰트·이미지 정착 전 기준 스냅샷 캡처)
+            this._isMountingPipeline = true;
+            this._layoutLogChannel = createBufferedLayoutLogger(
+                this.logger,
+                this,
+                () => this._isMountingPipeline || !this.isActive
+            );
+            this.paginator = new PaginatorLayout(this.doc, {
+                logger: this._layoutLogChannel.logger || this.logger
+            });
             this.paginator.applyLayout(this._lastLayoutOptions);
+            this._initialLayoutSnapshot = captureLayoutSnapshot(this, 'initial_pre_font', this.logger);
 
             // 6. 웹폰트 및 이미지 디코딩 완료 대기 (안전 타임아웃 포함)
             await this._waitForFontsAndImages(token);
@@ -206,13 +246,29 @@ export class ChapterFrame {
             this.syncViewportClipMask({ enabled: true });
 
             this.state = FrameState.READY;
+            this._isMountingPipeline = false;
 
-            this.logger?.trace?.({
-                action: 'frameReady',
-                caller: 'ChapterFrame:mount',
-                state: this.state,
-                delta: `spine=${this.spineIndex}, pages=${finalLayout.totalPages}`,
-                result: `active=${this.isActive}, initPos=${initialPosition}`
+            const finalSnapshot = captureLayoutSnapshot(this, 'final_settled', this.logger);
+            const bufferedLogs = this._layoutLogChannel?.drain?.() || [];
+            this._lastLayoutSnapshot = finalSnapshot;
+
+            if (this.isActive) {
+                this.logger?.trace?.({
+                    scope: 'ChapterFrame',
+                    action: 'frameReady',
+                    caller: 'ChapterFrame:mount',
+                    state: this.state,
+                    delta: `spine=${this.spineIndex}, pages=${finalLayout.totalPages}`,
+                    result: `active=${this.isActive}, initPos=${initialPosition}`
+                });
+            }
+
+            emitPureLayoutReport({
+                logger: this.logger,
+                snapshot: finalSnapshot,
+                prevSnapshot: this._initialLayoutSnapshot,
+                bufferedLogs,
+                trigger: 'mount'
             });
 
             if (this.hookBus && typeof this.hookBus.emitAsync === 'function') {
@@ -227,6 +283,7 @@ export class ChapterFrame {
 
             return this;
         } catch (err) {
+            this._isMountingPipeline = false;
             if (!this.isDestroyed) {
                 this.state = FrameState.FAILED;
                 this.logger?.error?.(`❌ [ChapterFrame:${this.spineIndex}] 마운트 실패:`, err);
@@ -287,6 +344,9 @@ export class ChapterFrame {
         const iframe = document.createElement('iframe');
         iframe.className = 'ewb-chapter-frame';
         iframe.dataset.spineIndex = String(this.spineIndex);
+        if (this.isBaseline) {
+            iframe.dataset.ewbBaseline = 'true';
+        }
         iframe.setAttribute('scrolling', 'no');
 
         this._applyIframeBoxStyles(iframe, metrics, layoutOptions);
@@ -575,6 +635,26 @@ export class ChapterFrame {
     }
 
     /**
+     * 현재 프레임의 순수 조판·스타일·물리 치수 스냅샷 복사본을 읽기 전용으로 반환합니다.
+     * - ewb 로거가 비활성화되어 내부 캐시(_lastLayoutSnapshot)가 null인 경우에도 즉시 실측해 반환합니다.
+     * @param {Object} [options={}]
+     * @param {boolean} [options.forceCapture=false] - true면 캐시를 무시하고 현재 DOM 기준으로 새로 계측
+     * @returns {{ initial: Object|null, last: Object|null }|null}
+     */
+    getLayoutSnapshot({ forceCapture = false } = {}) {
+        if (this.isDestroyed || !this.doc?.body?.isConnected) return null;
+
+        const current = (!forceCapture && this._lastLayoutSnapshot)
+            ? this._lastLayoutSnapshot
+            : (captureLayoutSnapshot(this, 'api_query', null) || this._lastLayoutSnapshot);
+
+        return {
+            initial: cloneLayoutSnapshot(this._initialLayoutSnapshot),
+            last: cloneLayoutSnapshot(current)
+        };
+    }
+
+    /**
      * 설정이나 뷰포트 크기가 바뀔 때 프레임을 재조판합니다.
      * @param {Object} [layoutOptions={}]
      * @param {Range|Element|null} [anchorTarget=null] - 재조판 후 복원할 DOM Range/Element
@@ -590,16 +670,40 @@ export class ChapterFrame {
             return { totalPages: 1, currentPage: 0 };
         }
 
-        const metrics = calculateLayoutMetrics(this._lastLayoutOptions);
-        this._applyIframeBoxStyles(this.iframe, metrics, this._lastLayoutOptions);
-        const res = this.paginator.applyLayout(this._lastLayoutOptions);
+        const prevSnapshot = this._lastLayoutSnapshot || this._initialLayoutSnapshot;
+        let res = { totalPages: 1 };
+        let jumped = null;
 
-        if (anchorTarget) {
-            const jumped = this.paginator.scrollToTarget(anchorTarget, 'instant');
+        this._isMountingPipeline = true;
+        try {
+            const metrics = calculateLayoutMetrics(this._lastLayoutOptions);
+            this._applyIframeBoxStyles(this.iframe, metrics, this._lastLayoutOptions);
+            res = this.paginator.applyLayout(this._lastLayoutOptions);
+
+            if (anchorTarget) {
+                jumped = this.paginator.scrollToTarget(anchorTarget, 'instant');
+            }
             this.syncViewportClipMask({ enabled: true });
+        } finally {
+            this._isMountingPipeline = false;
+        }
+
+        const relayoutSnapshot = captureLayoutSnapshot(this, 'relayout', this.logger);
+        const bufferedLogs = this._layoutLogChannel?.drain?.() || [];
+        if (relayoutSnapshot) {
+            this._lastLayoutSnapshot = relayoutSnapshot;
+            emitPureLayoutReport({
+                logger: this.logger,
+                snapshot: relayoutSnapshot,
+                prevSnapshot,
+                bufferedLogs,
+                trigger: 'relayout'
+            });
+        }
+
+        if (jumped) {
             return { totalPages: jumped.totalPages, currentPage: jumped.currentPage };
         }
-        this.syncViewportClipMask({ enabled: true });
         const stats = this.paginator.getPaginationMetrics();
         return { totalPages: res.totalPages, currentPage: stats.currentPage };
     }
@@ -732,6 +836,7 @@ export class ChapterFrame {
         this.state = FrameState.DESTROYED;
         this._mountToken++;
         this._maskedBottomPx = 0;
+        this._isMountingPipeline = false;
 
         if (this.hookBus && typeof this.hookBus.emitSync === 'function') {
             this.hookBus.emitSync('onFrameDestroy', {
@@ -762,5 +867,8 @@ export class ChapterFrame {
 
         this.doc = null;
         this._readyPromise = null;
+        this._layoutLogChannel = null;
+        this._initialLayoutSnapshot = null;
+        this._lastLayoutSnapshot = null;
     }
 }
