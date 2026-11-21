@@ -12,11 +12,12 @@
 - **단일 / 트리플 슬롯 전환 (`SlotController`)**: `slotMode: 'triple'`(현재 ± 1 챕터 유휴 사전 조판으로 0ms 전환)과 경량 `'single'` 모드를 생성자나 런타임에서 자유롭게 전환할 수 있습니다.
 - **짝수 베이스라인 조판 & 한 줄 스냅 (`ViewportSnap`, `PaginatorLayout`)**:
   - `paginated` 모드: 1단/2단(`auto`, `single`, `double`) CSS Multi-column 조판 및 2단 마지막 페이지 홀수 컬럼 여백 보정
-  - `scrolled` 모드: 가용 높이 기반 정수 줄 높이 스냅, 상단 소형 빈 줄 스킵(`skipLeadingBlankLines`), 하단 걸침 줄 `clip-path` 마스킹 및 정수배 End Spacer 마감
+  - `scrolled` 모드: 가용 높이 기반 정수 줄 높이 스냅, 상단 소형 빈 줄 스킵(`skipLeadingBlankLines`), 하단 걸침 줄 `clip-path` 마스킹, 정수배 End Spacer 마감 및 네이티브 스크롤 140ms 정착 동기화(`onNativeScrollEnd`)
 - **스타일·테마 3계층 분리**: 코어 레이아웃(`#ewb-core-layout-style`), 사용자 타이포그래피(`#ewb-user-style`), 색상 테마(`#ewb-theme-style`)가 분리되어 `setTheme()` 호출 시 재조판 없이 0ms 색상 전환이 가능합니다.
-- **Mod/Plugin 확장 아키텍처 (`HookBus`, `EngineContext`)**: 11개 라이프사이클 훅(`priority` 정렬 및 인터셉트 지원)과 `registerApi()` / `getApi()` 공용 API 레지스트리를 제공합니다.
+- **입력 출처(`source`) 전파 계약**: 이동·스크롤·재조판 API가 선택적 `source` 식별자(`'keyboard'`, `'mouseWheel'`, `'touchTap'`, `'touchScroll'`, `'nativeTouch'`, `'gamepad'`, `'autoScroll'`, `'tts'` 등)를 수용해 엔진 추적 로그와 `relocate` / `onRelocate` payload에 `trigger` + `source`를 일관 전달합니다.
+- **Mod/Plugin 확장 아키텍처 (`HookBus`, `EngineContext`)**: 12개 라이프사이클 훅(`priority` 정렬 및 인터셉트 지원), `registerApi()` / `getApi()` 공용 API 레지스트리 및 순수 기준 비교 계측(`getLayoutSnapshot()`, `measurePureBaseline()`)을 제공합니다.
 - **EPUB 2.0 / 3.0 표준 파싱 & 자동 GC (`ZipReader`, `EpubParser`, `ResourceResolver`)**: `fflate` 기반 ZIP 해제, `container.xml` → `OPF` → `Nav`/`NCX` 파싱, CSS `@import`/`url()` 재귀 Blob 치환 및 `destroy()` 시 일괄 `URL.revokeObjectURL()` 정리를 수행합니다.
-- **표준 EPUB CFI 코덱 (`CfiCodec`)**: 단일 점 CFI, 2분할/3분할 범위 CFI 인코딩·디코딩 및 `[id]` 힌트 기반 DOM Range 복원을 지원합니다.
+- **표준 EPUB CFI 코덱 (`CfiCodec`)**: 단일 점 CFI, 2분할/3분할 범위 CFI 인코딩·디코딩, `[id]` 힌트 기반 DOM Range 복원 및 시작점 비교 헬퍼(`compareCfiStart`, `isSameCfiStart`)를 지원합니다.
 - **Foliate 호환 브릿지 (`FoliateCompatView`)**: 기존 `foliate-view` 호출 코드에서 점진적으로 전환할 수 있도록 `<ewb-compat-view>` Web Component 어댑터를 기본 내장합니다.
 
 ---
@@ -40,7 +41,7 @@
     │   ├── EwbEngine.js          # 엔진 오케스트레이터 & 공개 API
     │   ├── SlotController.js     # single / triple 슬롯 및 0ms 챕터 전환
     │   ├── ChapterFrame.js       # 단일 챕터 iframe 수명주기 & 조판
-    │   ├── HookBus.js            # 11대 라이프사이클 훅 중계소
+    │   ├── HookBus.js            # 12대 라이프사이클 훅 중계소
     │   └── EngineContext.js      # Mod용 공식 API 집합소 & registerApi 레지스트리
     ├── layout/
     │   ├── PaginatorLayout.js    # 다단(paginated) & 세로(scrolled) 조판 엔진
@@ -53,7 +54,8 @@
     ├── bridge/
     │   └── FoliateCompatView.js  # <ewb-compat-view> 호환 Web Component 어댑터
     └── utils/
-        └── Logger.js             # 4대 컨텍스트 추적 로거 (EngineLogger)
+        ├── Logger.js             # 4대 컨텍스트 추적 로거 (EngineLogger)
+        └── LayoutTraceReporter.js # 순수 조판 스냅샷 & 그룹 추적 리포터
 
 ---
 
@@ -75,6 +77,7 @@
         flow: 'paginated',
         pageSpread: 'auto',
         transition: 'instant',
+        autoResize: true,
         fontSize: 16,
         lineHeight: 1.5,
         margins: { top: 32, bottom: 32, left: 40, right: 40 },
@@ -88,7 +91,7 @@
 
     engine.on('relocate', ({ detail }) => {
         console.log(
-            `챕터 ${detail.spineIndex + 1} | ${detail.page + 1}/${detail.totalPages}p | ${(detail.fraction * 100).toFixed(1)}%`
+            `챕터 ${detail.spineIndex + 1} | ${detail.page + 1}/${detail.totalPages}p | ${(detail.fraction * 100).toFixed(1)}% | [${detail.trigger}:${detail.source}]`
         );
     });
 
@@ -116,7 +119,8 @@
 - `flow` (`'paginated' | 'scrolled'`, 기본값 `'paginated'`): 가로 다단 또는 세로 스크롤
 - `pageSpread` (`'auto' | 'single' | 'double'`, 기본값 `'auto'`): 가로 화면 다단 열 수 (`auto`는 600px 이상 가로화면에서 2단)
 - `transition` (`'instant' | 'smooth'`, 기본값 `'instant'`): 페이지 이동 스크롤 방식
-- `skipLeadingBlankLines` (`boolean`, 기본값 `true`): `scrolled` 모드 이동 시 상단 소형 빈 줄(2.5줄 이하) 자동 스킵
+- `skipLeadingBlankLines` (`boolean`, 기본값 `false`): `scrolled` 모드 페이지 이동 시 상단 소형 빈 줄(2.5줄 이하) 자동 스킵 여부
+- `autoResize` (`boolean`, 기본값 `true`): 컨테이너 `ResizeObserver`의 150ms 디바운스 자동 `relayout()` 활성 여부 (외부 뷰포트 관리자를 사용할 때는 `false`로 설정 가능)
 - `fontSize` (`number`, 기본값 `16`): 기본 글자 크기 (`px`)
 - `lineHeight` (`number`, 기본값 `1.4`): 기본 줄간격 배수
 - `margins` (`{ top, bottom, left, right }`, 기본값 `{ 40, 40, 48, 48 }`): 4방향 여백 (`px`)
@@ -148,24 +152,24 @@
 
 ### 페이지 · 챕터 · 위치 이동
 
-    // 다음 / 이전 페이지 (챕터 경계 도달 시 다음/이전 챕터로 자동 전환)
-    await engine.nextPage();
-    await engine.prevPage();
+    // 다음 / 이전 페이지 (챕터 경계 도달 시 다음/이전 챕터로 자동 전환, source 생략 가능)
+    await engine.nextPage({ source: 'keyboard' });
+    await engine.prevPage({ source: 'touchTap' });
 
     // 챕터 단위 이동 (기본값: 'start', 마지막 페이지 진입 시 'end')
-    await engine.nextChapter({ position: 'start' });
-    await engine.prevChapter({ position: 'end' });
+    await engine.nextChapter({ position: 'start', source: 'tts' });
+    await engine.prevChapter({ position: 'end', source: 'api' });
 
     // 특정 위치 이동 (스파인 인덱스, EPUB CFI, href#id, { spineIndex, anchor })
     await engine.goTo(3);
-    await engine.goTo('epubcfi(/6/8!/4/2/1:12)');
+    await engine.goTo('epubcfi(/6/8!/4/2/1:12)', { source: 'bookmark' });
     await engine.goTo('Text/chapter2.xhtml#sec-1');
 
     // 현재 챕터 내 페이지 / 끝점 / 픽셀 / 줄 이동
     engine.goToPage(0, 'instant');
     engine.goToEnd();
-    engine.scrollByPixels(120, 'instant');
-    engine.scrollByLines(3, 'smooth');
+    engine.scrollByPixels(120, 'instant', { source: 'mouseWheel' });
+    engine.scrollByLines(3, 'smooth', { source: 'keyboard' });
 
 ### 레이아웃 · 여백 · 스타일 동적 변경
 
@@ -232,15 +236,16 @@
 
     engine.use(SampleMod);
 
-### 제공되는 11대 라이프사이클 훅 (`HookBus`)
+### 제공되는 12대 라이프사이클 훅 (`HookBus`)
 
 - `onAfterParse` (비동기 브로드캐스트): `{ book, engine }` — 파싱 완료 직후 1회
-- `onTransformHtml` (비동기 순차 변환): `(html, { index, href, id }) => string` — HTML DOM 파싱 전 정제 파이프라인
+- `onTransformHtml` (비동기 순차 변환): `(html, { spineIndex, href, frame }) => string` — HTML 마운트 전 정제 파이프라인
 - `onFrameMount` (비동기 브로드캐스트): `{ spineIndex, href, doc, frame }` — iframe DOM 획득 직후, 1차 조판 전
 - `onFrameReady` (비동기 브로드캐스트): `{ spineIndex, href, doc, frame, pagination }` — 웹폰트·이미지·Spacer 완료 후
 - `onBoundaryReached` (비동기 인터셉트): `{ direction, currentIndex, targetIndex, currentFrame }` — `{ handled: true }` 반환 시 기본 챕터 전환 중단
 - `onLinkClick` (동기 인터셉트): `{ spineIndex, chapterHref, href, anchor, isExternal, event, doc, frame }` — 코어 기본 핸들러는 `priority: 999`
-- `onRelocate` (동기 브로드캐스트): `{ ...location, trigger }` — 이동/재조판마다 실행
+- `onNativeScrollEnd` (동기 브로드캐스트): `{ spineIndex, frame }` — `scrolled` 모드 네이티브 스크롤 정착(140ms) 후 1회 발행 (코어 기본 핸들러 `priority: 999`가 `trigger: 'nativeScroll'`, `source: 'nativeTouch'`로 `relocate` 발행)
+- `onRelocate` (동기 브로드캐스트): `{ ...location, trigger, source }` — 이동·스크롤 정착·재조판마다 실행
 - `onRelayout` (동기 브로드캐스트): `{ spineIndex, metrics, layoutOptions }` — `relayout()` 직후 실행
 - `onThemeChange` (동기 브로드캐스트): `{ theme, themeCss }` — `setTheme()` 호출 시 실행
 - `onFrameDestroy` (동기 브로드캐스트): `{ spineIndex, href, doc, frame }` — 프레임 해제 직전 실행
@@ -321,4 +326,3 @@ AI는 사전에 정의된 개발 규칙과 프로젝트 운영 지침에 따라 
 개발자는 프로젝트의 목표와 개발 원칙을 정의하고, AI의 분석 결과와 수정 제안을 검토하여 주요 기술적 의사결정 및 변경 사항을 승인했습니다. 특히 사전 협의와 승인 없이는 기존 코드나 합의되지 않은 동작을 임의로 변경하지 않도록 승인 기반 개발 절차를 적용했습니다.
 
 AI의 분석 및 구현 역량과 개발자의 기획·감독·의사결정을 결합한 AI 협업 개발 프로젝트입니다.
-

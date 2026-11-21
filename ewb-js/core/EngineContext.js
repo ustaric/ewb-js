@@ -134,16 +134,16 @@ export class EngineContext {
     }
 
     goTo(target, options) { return this._engine?.goTo?.(target, options); }
-    goToPage(pageIndex, behavior) { return this._engine?.goToPage?.(pageIndex, behavior) || null; }
-    goToEnd() { return this._engine?.goToEnd?.() || null; }
-    scrollToTarget(target, behavior) { return this._engine?.scrollToTarget?.(target, behavior) || null; }
+    goToPage(pageIndex, behavior, extraOptions) { return this._engine?.goToPage?.(pageIndex, behavior, extraOptions) || null; }
+    goToEnd(options) { return this._engine?.goToEnd?.(options) || null; }
+    scrollToTarget(target, behavior, extraOptions) { return this._engine?.scrollToTarget?.(target, behavior, extraOptions) || null; }
     nextPage(options) { return this._engine?.nextPage?.(options); }
     prevPage(options) { return this._engine?.prevPage?.(options); }
     nextChapter(options) { return this._engine?.nextChapter?.(options); }
     prevChapter(options) { return this._engine?.prevChapter?.(options); }
-    scrollByPixels(deltaPx, behavior) { return this._engine?.scrollByPixels?.(deltaPx, behavior); }
-    scrollByLines(lineCount, behavior) { return this._engine?.scrollByLines?.(lineCount, behavior); }
-    relayout() { return this._engine?.relayout?.(); }
+    scrollByPixels(deltaPx, behavior, extraOptions) { return this._engine?.scrollByPixels?.(deltaPx, behavior, extraOptions); }
+    scrollByLines(lineCount, behavior, extraOptions) { return this._engine?.scrollByLines?.(lineCount, behavior, extraOptions); }
+    relayout(options) { return this._engine?.relayout?.(options); }
     setLayoutOptions(partial) { return this._engine?.setLayoutOptions?.(partial); }
     getLayoutOptions() { return this._engine?.getLayoutOptions?.() || null; }
     getMargins() { return this._engine?.getMargins?.() || null; }

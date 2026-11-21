@@ -3,6 +3,7 @@
  * - 🏛️ [상태 머신] IDLE ➔ MOUNTING ➔ RENDERING ➔ READY ➔ DESTROYED
  * - ⚡ [사전 완결 대기] HTML 주입, 훅, 스타일, 웹폰트, 이미지, Spacer까지 100% 끝난 readyPromise 제공
  * - 🎨 [테마 계층 분리] 코어 조판(#ewb-core-layout-style) / 사용자 스타일(#ewb-user-style) / 테마(#ewb-theme-style) 독립 주입
+ * - 📱 [네이티브 스크롤 중계] scrolled 모드 시 iframe 네이티브 스크롤 허용 및 정착(140ms) 후 1회 onNativeScrollEnd 발행
  * - 🔬 [순수 조판 추적] 1차(폰트·정착 전) ➔ 최종 조판·relayout 스냅샷 비교 및 활성/프리로드 그룹 분리 출력
  * - 📐 [스냅샷 관측 API] getLayoutSnapshot()으로 ewb 로거 OFF 상태에서도 현재 조판 스냅샷 읽기 전용 제공
  * - 🔬 [잘림·문단 계측 & 하단 마스킹] getClippingMetrics() 및 scrolled 모드 하단 걸침 줄 clip-path 보정 제공
@@ -37,6 +38,7 @@ export const FrameState = {
 
 const USER_STYLE_ID = 'ewb-user-style';
 const THEME_STYLE_ID = 'ewb-theme-style';
+const NATIVE_SCROLL_SETTLE_MS = 140;
 
 /**
  * 지정된 시간(ms) 후 무조건 resolve되는 안전 타임아웃 프로미스
@@ -117,6 +119,9 @@ export class ChapterFrame {
         this._lastLayoutOptions = {};
         this._maskedBottomPx = 0;
 
+        this._suppressNativeScrollUntil = 0;
+        this._nativeScrollSettleTimer = null;
+
         this._isMountingPipeline = false;
         this._layoutLogChannel = null;
         this._initialLayoutSnapshot = null;
@@ -196,11 +201,12 @@ export class ChapterFrame {
                 throw new Error(`ChapterFrame(${this.spineIndex}) failed to acquire iframe document`);
             }
 
-            // 4. 사용자 스타일, 테마 스타일, 내부 링크 클릭 중계 및 onFrameMount 훅 주입
+            // 4. 사용자 스타일, 테마 스타일, 내부 링크 클릭 중계, 네이티브 스크롤 감지 및 onFrameMount 훅 주입
             this.state = FrameState.RENDERING;
             this.setUserStyle(this._userCss);
             this.setThemeStyle(this._themeCss);
             this._bindLinkClickListener();
+            this._bindNativeScrollListener();
 
             if (this.hookBus && typeof this.hookBus.emitAsync === 'function') {
                 await this.hookBus.emitAsync('onFrameMount', {
@@ -222,6 +228,7 @@ export class ChapterFrame {
             this.paginator = new PaginatorLayout(this.doc, {
                 logger: this._layoutLogChannel.logger || this.logger
             });
+            this._markProgrammaticScroll(120);
             this.paginator.applyLayout(this._lastLayoutOptions);
             this._initialLayoutSnapshot = captureLayoutSnapshot(this, 'initial_pre_font', this.logger);
 
@@ -236,6 +243,8 @@ export class ChapterFrame {
             const finalOptions = this._lastLayoutOptions;
             const finalMetrics = calculateLayoutMetrics(finalOptions);
             this._applyIframeBoxStyles(this.iframe, finalMetrics, finalOptions);
+            this._syncScrollingAttribute(finalOptions.flow);
+            this._markProgrammaticScroll(120);
             const finalLayout = this.paginator.applyLayout(finalOptions);
 
             if (initialPosition === 'end') {
@@ -325,6 +334,104 @@ export class ChapterFrame {
     }
 
     /**
+     * scrolled 모드에서 사용자 네이티브 스크롤을 감지해 스크롤 중 마스킹을 즉시 해제하고 정착 후 1회만 onNativeScrollEnd를 발행합니다.
+     * @returns {void}
+     * @private
+     */
+    _bindNativeScrollListener() {
+        if (!this.doc) return;
+        this.doc.addEventListener('scroll', () => {
+            if (this.isDestroyed || this.isBaseline || !this.isActive) return;
+            if (this.paginator?.flow !== 'scrolled' && this._lastLayoutOptions?.flow !== 'scrolled') return;
+            if (Date.now() < this._suppressNativeScrollUntil) return;
+
+            this._clearClipMaskFast();
+
+            if (this._nativeScrollSettleTimer) {
+                clearTimeout(this._nativeScrollSettleTimer);
+            }
+            this._nativeScrollSettleTimer = setTimeout(() => {
+                this._nativeScrollSettleTimer = null;
+                if (this.isDestroyed || this.isBaseline || !this.isActive) return;
+                if (this.paginator?.flow !== 'scrolled') return;
+                if (Date.now() < this._suppressNativeScrollUntil) return;
+
+                const stats = this.getMetrics();
+                this.logger?.trace?.({
+                    scope: 'ChapterFrame',
+                    action: 'nativeScrollEnd',
+                    caller: 'ChapterFrame:_bindNativeScrollListener',
+                    state: this.paginator.flow,
+                    delta: `spine=${this.spineIndex}, scrollPos=${stats.scrollPos.toFixed(1)}px, page=${stats.currentPage + 1}/${stats.totalPages}`,
+                    result: 'emit onNativeScrollEnd'
+                });
+
+                if (this.hookBus && typeof this.hookBus.emitSync === 'function') {
+                    this.hookBus.emitSync('onNativeScrollEnd', {
+                        spineIndex: this.spineIndex,
+                        frame: this
+                    }, { stopOnHandled: false });
+                }
+            }, NATIVE_SCROLL_SETTLE_MS);
+        }, { capture: true, passive: true, signal: this._abortController.signal });
+    }
+
+    /**
+     * 프로그래매틱 scrollTo 호출 직후 발생하는 브라우저 비동기 scroll 이벤트를 억제해 중복 relocate를 방지합니다.
+     * @param {number} [durationMs=120] - 억제 유지 시간(ms)
+     * @returns {void}
+     * @private
+     */
+    _markProgrammaticScroll(durationMs = 120) {
+        const until = Date.now() + Math.max(0, Number(durationMs) || 0);
+        if (until > this._suppressNativeScrollUntil) {
+            this._suppressNativeScrollUntil = until;
+        }
+        if (this._nativeScrollSettleTimer) {
+            clearTimeout(this._nativeScrollSettleTimer);
+            this._nativeScrollSettleTimer = null;
+        }
+    }
+
+    /**
+     * 네이티브 스크롤 중 DOM 라인 실측 없이 하단 clipPath 마스킹만 O(1) 비용으로 즉시 해제합니다.
+     * @returns {void}
+     * @private
+     */
+    _clearClipMaskFast() {
+        if (this._maskedBottomPx > 0 && this.iframe && !this.isDestroyed) {
+            this._maskedBottomPx = 0;
+            this.iframe.style.clipPath = 'none';
+        }
+    }
+
+    /**
+     * 대기 중인 네이티브 스크롤 정착 타이머를 취소합니다.
+     * @returns {void}
+     * @private
+     */
+    _clearNativeScrollSettleTimer() {
+        if (this._nativeScrollSettleTimer) {
+            clearTimeout(this._nativeScrollSettleTimer);
+            this._nativeScrollSettleTimer = null;
+        }
+    }
+
+    /**
+     * 현재 flow 모드에 맞춰 iframe의 scrolling 속성을 동기화합니다.
+     * @param {'paginated'|'scrolled'} [flow] - 현재 조판 흐름 모드
+     * @returns {void}
+     * @private
+     */
+    _syncScrollingAttribute(flow) {
+        if (!this.iframe || this.isDestroyed) return;
+        const nextScrolling = flow === 'scrolled' ? 'auto' : 'no';
+        if (this.iframe.getAttribute('scrolling') !== nextScrolling) {
+            this.iframe.setAttribute('scrolling', nextScrolling);
+        }
+    }
+
+    /**
      * 비동기 작업 유효성 검증 (파괴 여부 및 토큰 일치)
      * @private
      */
@@ -347,7 +454,7 @@ export class ChapterFrame {
         if (this.isBaseline) {
             iframe.dataset.ewbBaseline = 'true';
         }
-        iframe.setAttribute('scrolling', 'no');
+        iframe.setAttribute('scrolling', layoutOptions?.flow === 'scrolled' ? 'auto' : 'no');
 
         this._applyIframeBoxStyles(iframe, metrics, layoutOptions);
         this._syncVisibilityStyles(iframe, this.isActive);
@@ -357,7 +464,11 @@ export class ChapterFrame {
     }
 
     /**
-     * iframe 외곽 박스 크기 및 여백 스타일을 반영합니다.
+     * iframe 외곽 박스 크기 및 여백 스타일을 반영합니다. (챕터 스왑 시 즉각 전환을 위해 transition 비활성)
+     * @param {HTMLIFrameElement} iframe - 대상 iframe 엘리먼트
+     * @param {Object} metrics - 계산된 레이아웃 메트릭
+     * @param {Object} [layoutOptions={}] - 레이아웃 옵션 객체
+     * @returns {void}
      * @private
      */
     _applyIframeBoxStyles(iframe, metrics, layoutOptions = {}) {
@@ -373,7 +484,7 @@ export class ChapterFrame {
             padding: '0',
             background: bgColor,
             boxSizing: 'border-box',
-            transition: 'opacity 140ms ease-out'
+            transition: 'none'
         });
     }
 
@@ -675,9 +786,11 @@ export class ChapterFrame {
         let jumped = null;
 
         this._isMountingPipeline = true;
+        this._markProgrammaticScroll(150);
         try {
             const metrics = calculateLayoutMetrics(this._lastLayoutOptions);
             this._applyIframeBoxStyles(this.iframe, metrics, this._lastLayoutOptions);
+            this._syncScrollingAttribute(this._lastLayoutOptions.flow);
             res = this.paginator.applyLayout(this._lastLayoutOptions);
 
             if (anchorTarget) {
@@ -714,6 +827,7 @@ export class ChapterFrame {
     activate() {
         if (this.isDestroyed) return;
         this.isActive = true;
+        this._syncScrollingAttribute(this._lastLayoutOptions?.flow);
         this._syncVisibilityStyles(this.iframe, true);
         this.syncViewportClipMask({ enabled: true });
     }
@@ -724,6 +838,7 @@ export class ChapterFrame {
     deactivate() {
         if (this.isDestroyed) return;
         this.isActive = false;
+        this._clearNativeScrollSettleTimer();
         this._syncVisibilityStyles(this.iframe, false);
     }
 
@@ -802,28 +917,75 @@ export class ChapterFrame {
         });
     }
 
+    /**
+     * 다음 페이지로 이동합니다.
+     * @param {Object} [options={}]
+     * @returns {{ moved: boolean, atBoundary: 'end'|null, currentPage: number, totalPages: number }}
+     */
     nextPage(options = {}) {
-        return this.paginator ? this.paginator.nextPage(options) : { moved: false, atBoundary: 'end', currentPage: 0, totalPages: 1 };
+        if (!this.paginator) return { moved: false, atBoundary: 'end', currentPage: 0, totalPages: 1 };
+        const behavior = options.behavior || this._lastLayoutOptions?.transition;
+        this._markProgrammaticScroll(behavior === 'smooth' ? 450 : 120);
+        return this.paginator.nextPage(options);
     }
 
+    /**
+     * 이전 페이지로 이동합니다.
+     * @param {Object} [options={}]
+     * @returns {{ moved: boolean, atBoundary: 'start'|null, currentPage: number, totalPages: number }}
+     */
     prevPage(options = {}) {
-        return this.paginator ? this.paginator.prevPage(options) : { moved: false, atBoundary: 'start', currentPage: 0, totalPages: 1 };
+        if (!this.paginator) return { moved: false, atBoundary: 'start', currentPage: 0, totalPages: 1 };
+        const behavior = options.behavior || this._lastLayoutOptions?.transition;
+        this._markProgrammaticScroll(behavior === 'smooth' ? 450 : 120);
+        return this.paginator.prevPage(options);
     }
 
+    /**
+     * 지정된 0-based 페이지 번호로 이동합니다.
+     * @param {number} pageIndex
+     * @param {'instant'|'smooth'} [behavior]
+     * @returns {{ moved: boolean, currentPage: number, totalPages: number }}
+     */
     goToPage(pageIndex, behavior) {
-        return this.paginator ? this.paginator.goToPage(pageIndex, behavior) : { moved: false, currentPage: 0, totalPages: 1 };
+        if (!this.paginator) return { moved: false, currentPage: 0, totalPages: 1 };
+        const effectiveBehavior = behavior || this._lastLayoutOptions?.transition;
+        this._markProgrammaticScroll(effectiveBehavior === 'smooth' ? 450 : 120);
+        return this.paginator.goToPage(pageIndex, behavior);
     }
 
+    /**
+     * 챕터의 마지막 페이지로 즉시 이동합니다.
+     * @returns {{ moved: boolean, currentPage: number, totalPages: number }}
+     */
     goToEnd() {
-        return this.paginator ? this.paginator.goToEnd() : { moved: false, currentPage: 0, totalPages: 1 };
+        if (!this.paginator) return { moved: false, currentPage: 0, totalPages: 1 };
+        this._markProgrammaticScroll(120);
+        return this.paginator.goToEnd();
     }
 
+    /**
+     * 픽셀 단위로 스크롤합니다.
+     * @param {number} deltaPx
+     * @param {'instant'|'smooth'} [behavior]
+     * @returns {{ moved: boolean, atBoundary: 'start'|'end'|null }}
+     */
     scrollByPixels(deltaPx, behavior) {
-        return this.paginator ? this.paginator.scrollByPixels(deltaPx, behavior) : { moved: false, atBoundary: null };
+        if (!this.paginator) return { moved: false, atBoundary: null };
+        this._markProgrammaticScroll(behavior === 'smooth' ? 450 : 120);
+        return this.paginator.scrollByPixels(deltaPx, behavior);
     }
 
+    /**
+     * 특정 DOM Range 또는 Element 위치로 이동합니다.
+     * @param {Range|Element} target
+     * @param {'instant'|'smooth'} [behavior]
+     * @returns {{ success: boolean, currentPage: number, totalPages: number }}
+     */
     scrollToTarget(target, behavior) {
-        return this.paginator ? this.paginator.scrollToTarget(target, behavior) : { success: false, currentPage: 0, totalPages: 1 };
+        if (!this.paginator) return { success: false, currentPage: 0, totalPages: 1 };
+        this._markProgrammaticScroll(behavior === 'smooth' ? 450 : 120);
+        return this.paginator.scrollToTarget(target, behavior);
     }
 
     /**
@@ -837,6 +999,7 @@ export class ChapterFrame {
         this._mountToken++;
         this._maskedBottomPx = 0;
         this._isMountingPipeline = false;
+        this._clearNativeScrollSettleTimer();
 
         if (this.hookBus && typeof this.hookBus.emitSync === 'function') {
             this.hookBus.emitSync('onFrameDestroy', {

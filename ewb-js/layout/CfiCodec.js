@@ -2,6 +2,7 @@
  * 🧭 국제 표준 EPUB CFI 인코더/디코더 및 DOM Range 좌표 변환기 (CfiCodec)
  * - 📜 [표준 규격 준수] epubcfi(/6/{spineStep}!/4/...:offset), 3분할 범위 CFI(common,start,end) 및 2분할 범위 CFI 완벽 지원
  * - 🛡️ [안전 복원] [id] 힌트 폴백, 오프셋 범위 클램핑(IndexSizeError 방지), 엔진 주입 요소 무시 탑재
+ * - 📐 [무의존성 좌표 비교] compareCfiStart / isSameCfiStart로 Range·Point·[id] 힌트 차이 없이 시작점 정밀 비교 지원
  * - 🔌 [무의존성 순수 모듈] 외부 라이브러리 없이 표준 DOM Node/Range API만으로 동작
  * 파일 경로: web/ewb-js/layout/CfiCodec.js
  * @module ewb-js/layout/CfiCodec
@@ -156,6 +157,56 @@ function resolveNodeBySteps(doc, steps) {
     return walkDownSteps(doc.documentElement, steps) || doc.body;
 }
 
+/**
+ * 유효한 epubcfi(...) 형식 문자열인지 검증합니다.
+ * @param {string} cfiString
+ * @returns {boolean}
+ */
+function isValidEpubCfiString(cfiString) {
+    if (typeof cfiString !== 'string') return false;
+    const raw = cfiString.trim();
+    return raw.startsWith('epubcfi(') && raw.endsWith(')');
+}
+
+/**
+ * 파싱된 두 CFI의 시작점(spineIndex, steps, offset) 선후 관계를 비교합니다.
+ * - [id] 힌트 유무와 Range 끝점 차이는 무시하고 시작 위치 숫자 좌표만 비교합니다.
+ * @param {Object} parsedA
+ * @param {Object} parsedB
+ * @returns {-1|0|1}
+ */
+function compareParsedStartPoints(parsedA, parsedB) {
+    if (parsedA.spineIndex !== parsedB.spineIndex) {
+        return parsedA.spineIndex < parsedB.spineIndex ? -1 : 1;
+    }
+
+    const stepsA = parsedA.start?.steps || [];
+    const stepsB = parsedB.start?.steps || [];
+    const minLen = Math.min(stepsA.length, stepsB.length);
+
+    for (let i = 0; i < minLen; i++) {
+        const idxA = stepsA[i].index;
+        const idxB = stepsB[i].index;
+        if (idxA !== idxB) {
+            return idxA < idxB ? -1 : 1;
+        }
+    }
+
+    if (stepsA.length !== stepsB.length) {
+        return stepsA.length < stepsB.length ? -1 : 1;
+    }
+
+    const offsetA = Number(parsedA.start?.offset ?? 0);
+    const offsetB = Number(parsedB.start?.offset ?? 0);
+    if (offsetA !== offsetB) {
+        return offsetA < offsetB ? -1 : 1;
+    }
+
+    return 0;
+}
+
+const sharedCfiCodec = new (class SharedCfiCodecProxy {})();
+
 export class CfiCodec {
     /**
      * 챕터 스파인 인덱스에 대한 기본 섹션 CFI를 생성합니다.
@@ -249,6 +300,32 @@ export class CfiCodec {
     }
 
     /**
+     * 두 EPUB CFI의 시작점(start) 위치를 비교합니다.
+     * - 유효한 epubcfi(...) 형식이 아닌 경우 null을 반환합니다.
+     * @param {string} cfiA
+     * @param {string} cfiB
+     * @param {Object|null} [book=null]
+     * @returns {-1|0|1|null}
+     */
+    compareStart(cfiA, cfiB, book = null) {
+        if (!isValidEpubCfiString(cfiA) || !isValidEpubCfiString(cfiB)) return null;
+        const parsedA = this.parse(cfiA, book);
+        const parsedB = this.parse(cfiB, book);
+        return compareParsedStartPoints(parsedA, parsedB);
+    }
+
+    /**
+     * 두 EPUB CFI의 시작점(start)이 동일한지 판별합니다. (끝점/힌트 ID 차이 무시)
+     * @param {string} cfiA
+     * @param {string} cfiB
+     * @param {Object|null} [book=null]
+     * @returns {boolean}
+     */
+    isSameStart(cfiA, cfiB, book = null) {
+        return this.compareStart(cfiA, cfiB, book) === 0;
+    }
+
+    /**
      * 파싱된 CFI 객체를 대상 Document의 DOM Range로 복원합니다.
      * @param {Object} parsedCfi - parse() 반환 객체
      * @param {Document} doc - 대상 챕터 iframe Document
@@ -299,4 +376,31 @@ export class CfiCodec {
             return null;
         }
     }
+}
+
+sharedCfiCodec.parse = CfiCodec.prototype.parse;
+
+/**
+ * 인스턴스 생성 없이 두 EPUB CFI의 시작점(start)을 비교하는 순수 헬퍼 함수
+ * @param {string} cfiA
+ * @param {string} cfiB
+ * @param {Object|null} [book=null]
+ * @returns {-1|0|1|null}
+ */
+export function compareCfiStart(cfiA, cfiB, book = null) {
+    if (!isValidEpubCfiString(cfiA) || !isValidEpubCfiString(cfiB)) return null;
+    const parsedA = sharedCfiCodec.parse(cfiA, book);
+    const parsedB = sharedCfiCodec.parse(cfiB, book);
+    return compareParsedStartPoints(parsedA, parsedB);
+}
+
+/**
+ * 인스턴스 생성 없이 두 EPUB CFI의 시작점(start)이 동일한지 확인하는 순수 헬퍼 함수
+ * @param {string} cfiA
+ * @param {string} cfiB
+ * @param {Object|null} [book=null]
+ * @returns {boolean}
+ */
+export function isSameCfiStart(cfiA, cfiB, book = null) {
+    return compareCfiStart(cfiA, cfiB, book) === 0;
 }

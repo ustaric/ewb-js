@@ -3,6 +3,7 @@
  * - 📖 [가로/세로 통합] paginated(가로 다단) 및 scrolled(세로 페이지/부드러운 스크롤) 단일 코어 지원
  * - 📏 [정수배 Spacer 마감] 세로 끝 여백 실측 보정(실제 본문 끝 좌표 검증 포함) 및 2단 홀수 컬럼 끝 여백 보정으로 마지막 빈 페이지 차단
  * - ✂️ [상단 잘림 & 빈 줄 스냅] scrolled 모드 이동/끝점 진입 시 상단 걸침 줄 및 소형 빈 줄을 첫 텍스트 줄에 정렬
+ * - 📱 [네이티브 스크롤 격리] scrolled 모드에서 overscroll-behavior: contain으로 새로고침/외부 체이닝 차단
  * - 🎯 [Range/앵커 즉시 점프] CFI Range 및 #id 앵커의 실측 좌표를 기반으로 목표 페이지/스크롤 위치 즉시 이동
  * - 🔌 [외부 스타일/훅 친화] 코어 조판 스타일(<style id="ewb-core-layout-style">)과 사용자 오버라이드를 분리 유지
  * 파일 경로: web/ewb-js/layout/PaginatorLayout.js
@@ -33,7 +34,7 @@ export class PaginatorLayout {
         this.metrics = null;
         this.flow = 'paginated';
         this.transition = 'instant';
-        this._skipLeadingBlankLines = true;
+        this._skipLeadingBlankLines = false;
         this._scrollEndTimer = null;
         this._actualContentBottom = 0;
     }
@@ -54,7 +55,7 @@ export class PaginatorLayout {
 
         this.flow = layoutOptions.flow === 'scrolled' ? 'scrolled' : 'paginated';
         this.transition = layoutOptions.transition === 'smooth' ? 'smooth' : 'instant';
-        this._skipLeadingBlankLines = layoutOptions.skipLeadingBlankLines !== false;
+        this._skipLeadingBlankLines = Boolean(layoutOptions.skipLeadingBlankLines);
         this.metrics = calculateLayoutMetrics({
             ...layoutOptions,
             flow: this.flow
@@ -82,8 +83,10 @@ export class PaginatorLayout {
 
     /**
      * 코어 조판 전용 스타일시트를 주입합니다. (사용자 테마/폰트 CSS와 충돌하지 않게 id 분리)
+     * - scrolled 모드에서는 overscroll-behavior: contain을 적용해 네이티브 터치 스크롤 시 pull-to-refresh 및 외부 바운스를 차단합니다.
      * @param {Object} m - calculateLayoutMetrics 결과 객체
      * @param {Object} [layoutOptions={}] - fontSize/lineHeight 기본값 참조용 레이아웃 옵션
+     * @returns {void}
      */
     _injectCoreLayoutCss(m, layoutOptions = {}) {
         const head = this.doc.head || this.doc.documentElement;
@@ -162,6 +165,8 @@ export class PaginatorLayout {
                     padding: 0 !important;
                     overflow-x: hidden !important;
                     overflow-y: auto !important;
+                    overscroll-behavior: contain !important;
+                    -webkit-overflow-scrolling: touch !important;
                     scrollbar-width: none !important;
                     -ms-overflow-style: none !important;
                 }

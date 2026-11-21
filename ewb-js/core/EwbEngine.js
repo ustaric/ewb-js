@@ -4,6 +4,8 @@
  * - 🎨 [테마 API 분리] setTheme / getTheme로 userCss(폰트/문단)를 유지한 채 배경색·글자색·링크색 0ms 즉시 전환
  * - 🪟 [슬롯 통합] SlotController를 통해 single / triple 슬롯 모드 및 0ms 챕터 전환 기본 제공
  * - 📐 [한 줄 스냅 & 부드러운 스크롤] ViewportSnap + PaginatorLayout 기반으로 가로/세로/애니메이션 제어
+ * - 📱 [네이티브 스크롤 정착 동기화] scrolled 모드 네이티브 스크롤 정착 시 1회 relocate 발행
+ * - 🧭 [입력 출처(source) 계약] trigger(동작) + source(입력 장치/호출자)를 엔진 로그 및 relocate 이벤트에 일관 전달
  * - 🔬 [정밀 뷰포트 추적 로그] 이동 시 첫째/마지막 줄, 줄·문단 수, 상하좌우 여백, 상·하단 잘림 실측치 통합 출력
  * - 🎯 [전체 API 개방] 이동, 좌표/라인 측정, 재조판, 검색, CFI 코덱, 프레임 순회까지 외부 커스텀 API 100% 개방
  * 파일 경로: web/ewb-js/core/EwbEngine.js
@@ -36,7 +38,8 @@ export class EwbEngine {
      * @param {'paginated'|'scrolled'} [options.flow='paginated'] - 보기 방식
      * @param {'auto'|'single'|'double'} [options.pageSpread='auto'] - 가로 다단 설정
      * @param {'instant'|'smooth'} [options.transition='instant'] - 페이지 전환 방식
-     * @param {boolean} [options.skipLeadingBlankLines=true] - scrolled 모드 페이지 이동 시 상단 소형 빈 줄 스킵 여부
+     * @param {boolean} [options.skipLeadingBlankLines=false] - scrolled 모드 페이지 이동 시 상단 소형 빈 줄 스킵 여부
+     * @param {boolean} [options.autoResize=true] - 컨테이너 ResizeObserver 자동 relayout 활성 여부 (외부 뷰포트 제어 시 false)
      * @param {number} [options.fontSize=16] - 기본 글자 크기 (px)
      * @param {number} [options.lineHeight=1.4] - 기본 줄간격 배수
      * @param {Object} [options.margins] - { top, bottom, left, right }
@@ -68,7 +71,7 @@ export class EwbEngine {
             flow: options.flow === 'scrolled' ? 'scrolled' : 'paginated',
             pageSpread: options.pageSpread || 'auto',
             transition: options.transition === 'smooth' ? 'smooth' : 'instant',
-            skipLeadingBlankLines: options.skipLeadingBlankLines !== false,
+            skipLeadingBlankLines: Boolean(options.skipLeadingBlankLines),
             fontSize: Number(options.fontSize || 16),
             lineHeight: Number(options.lineHeight || 1.4),
             marginTop: Number(options.margins?.top ?? options.marginTop ?? 40),
@@ -104,7 +107,7 @@ export class EwbEngine {
         /** @type {Map<string, Set<Function>>} */
         this._eventListeners = new Map();
 
-        // 3. 컨테이너 기본 스타일, 기본 내부 링크·테마·GC 폴백, SlotController 구성
+        // 3. 컨테이너 기본 스타일, 기본 내부 링크·테마·네이티브스크롤·GC 폴백, SlotController 구성
         this._prepareContainer();
         this._registerDefaultCoreHooks();
 
@@ -120,22 +123,24 @@ export class EwbEngine {
             logger: this.logger
         });
 
-        // 4. ResizeObserver 자동 대응
+        // 4. ResizeObserver 자동 대응 (autoResize: false 시 외부 뷰포트 관리자에게 위임)
+        this._autoResize = options.autoResize !== false;
         this._lastObservedSize = this._measureContainerSize();
         this._resizeTimer = null;
-        this._resizeObserver = this._initResizeObserver();
+        this._resizeObserver = this._autoResize ? this._initResizeObserver() : null;
 
         this._log.trace({
             action: 'init',
             caller: 'new EwbEngine',
             state: this.state,
-            delta: `${this._lastObservedSize.width}x${this._lastObservedSize.height}px, margins(T:${this.layoutOptions.marginTop} B:${this.layoutOptions.marginBottom} L:${this.layoutOptions.marginLeft} R:${this.layoutOptions.marginRight})`,
+            delta: `${this._lastObservedSize.width}x${this._lastObservedSize.height}px, margins(T:${this.layoutOptions.marginTop} B:${this.layoutOptions.marginBottom} L:${this.layoutOptions.marginLeft} R:${this.layoutOptions.marginRight}), autoResize=${this._autoResize}`,
             result: `slotMode=${this.slots.slotMode}, flow=${this.layoutOptions.flow}`
         });
     }
 
     /**
-     * 코어 기본 내부 앵커 링크 처리, 신규 프레임 테마 주입 및 외부 프레임 소독 훅을 등록합니다.
+     * 코어 기본 내부 앵커 링크 처리, 신규 프레임 테마 주입, 네이티브 스크롤 정착 동기화 및 외부 프레임 소독 훅을 등록합니다.
+     * @returns {void}
      * @private
      */
     _registerDefaultCoreHooks() {
@@ -148,9 +153,17 @@ export class EwbEngine {
         this.hookBus.on('onLinkClick', (payload) => {
             if (!payload || payload.isExternal || !payload.href) return;
             const resolvedHref = this._resolveRelativeHref(payload.href, payload.chapterHref || '');
-            this.goTo(resolvedHref, { behavior: 'instant' });
+            this.goTo(resolvedHref, { behavior: 'instant', source: 'internalLink' });
             return { handled: true };
         }, { priority: 999, name: 'ewb-default-link-handler' });
+
+        this.hookBus.on('onNativeScrollEnd', (payload) => {
+            if (this._isDestroyed || this.state !== EngineState.ACTIVE) return;
+            const currentFrame = this.slots.getCurrentFrame();
+            if (!payload?.frame || payload.frame !== currentFrame) return;
+            if (this.layoutOptions.flow !== 'scrolled') return;
+            this._emitRelocate('nativeScroll', 'nativeTouch');
+        }, { priority: 999, name: 'ewb-native-scroll-relocate' });
 
         this.hookBus.on('onFrameDestroy', (payload) => {
             if (payload?.frame && this._externalFrames.has(payload.frame)) {
@@ -346,7 +359,7 @@ export class EwbEngine {
                 this._resizeTimer = null;
                 if (this._isDestroyed || this.state !== EngineState.ACTIVE) return;
                 this._lastObservedSize = this._measureContainerSize();
-                this.relayout();
+                this.relayout({ source: 'resizeObserver' });
             }, 150);
         });
         observer.observe(this.container);
@@ -513,7 +526,7 @@ export class EwbEngine {
         this._setState(EngineState.READY);
 
         if (options.autoMount !== false) {
-            await this.goTo(options.initialLocation ?? 0, { behavior: 'instant' });
+            await this.goTo(options.initialLocation ?? 0, { behavior: 'instant', source: 'open' });
             this._setState(EngineState.ACTIVE);
         }
 
@@ -548,12 +561,15 @@ export class EwbEngine {
      * 🎯 숫자 인덱스, EPUB CFI 문자열, href#id, 또는 { spineIndex, anchor }로 이동합니다.
      * @param {number|string|Object} target
      * @param {Object} [options={}]
+     * @param {string} [options.behavior='instant']
+     * @param {string} [options.source='api'] - 호출자/입력 출처 식별자
      * @returns {Promise<Object|null>} 이동 후 현재 위치 스냅샷
      */
     async goTo(target, options = {}) {
         if (this._isDestroyed || !this.book) return null;
 
         const behavior = options.behavior || 'instant';
+        const source = options.source || 'api';
         let targetSpine = 0;
         let resolvedRangeOrEl = null;
 
@@ -606,7 +622,7 @@ export class EwbEngine {
         frame.syncViewportClipMask({ enabled: behavior !== 'smooth' });
         this._setState(EngineState.ACTIVE);
         this._emit('load', { spineIndex: frame.spineIndex, doc: frame.doc, frame });
-        return this._emitRelocate('goTo');
+        return this._emitRelocate('goTo', source);
     }
 
     /** @private */
@@ -632,12 +648,18 @@ export class EwbEngine {
         return { spineIndex: Math.max(0, idx), anchorId };
     }
 
-    /** 다음 페이지 이동 (챕터 끝 경계 시 다음 챕터 첫 페이지로 0ms 전환) */
+    /**
+     * 다음 페이지 이동 (챕터 끝 경계 시 다음 챕터 첫 페이지로 0ms 전환)
+     * @param {Object} [options={}]
+     * @param {string} [options.source='api'] - 입력 출처 식별자
+     * @returns {Promise<Object|null>}
+     */
     async nextPage(options = {}) {
         const frame = this.slots.getCurrentFrame();
         if (!frame || this._isDestroyed) return null;
 
         const behavior = options.behavior || this.layoutOptions.transition;
+        const source = options.source || 'api';
         const res = frame.nextPage(options);
         if (!res.moved && res.atBoundary === 'end') {
             const nextFrame = await this.slots.moveChapter('next', { initialPosition: 'start' });
@@ -649,15 +671,21 @@ export class EwbEngine {
         } else {
             frame.syncViewportClipMask({ enabled: behavior !== 'smooth' });
         }
-        return this._emitRelocate('nextPage');
+        return this._emitRelocate('nextPage', source);
     }
 
-    /** 이전 페이지 이동 (챕터 시작 경계 시 이전 챕터 마지막 페이지로 0ms 전환) */
+    /**
+     * 이전 페이지 이동 (챕터 시작 경계 시 이전 챕터 마지막 페이지로 0ms 전환)
+     * @param {Object} [options={}]
+     * @param {string} [options.source='api'] - 입력 출처 식별자
+     * @returns {Promise<Object|null>}
+     */
     async prevPage(options = {}) {
         const frame = this.slots.getCurrentFrame();
         if (!frame || this._isDestroyed) return null;
 
         const behavior = options.behavior || this.layoutOptions.transition;
+        const source = options.source || 'api';
         const res = frame.prevPage(options);
         if (!res.moved && res.atBoundary === 'start') {
             const prevFrame = await this.slots.moveChapter('prev', { initialPosition: 'end' });
@@ -669,102 +697,132 @@ export class EwbEngine {
         } else {
             frame.syncViewportClipMask({ enabled: behavior !== 'smooth' });
         }
-        return this._emitRelocate('prevPage');
+        return this._emitRelocate('prevPage', source);
     }
 
     /**
      * 다음 챕터로 이동합니다. (기본: 첫 페이지 'start')
      * @param {Object} [options={}]
      * @param {'start'|'end'} [options.position='start']
+     * @param {string} [options.source='api'] - 입력 출처 식별자
      * @returns {Promise<Object|null>}
      */
     async nextChapter(options = {}) {
         const initialPosition = options.position === 'end' ? 'end' : 'start';
+        const source = options.source || 'api';
         const nextFrame = await this.slots.moveChapter('next', { initialPosition });
         if (nextFrame) {
             nextFrame.syncViewportClipMask({ enabled: true });
             this._emit('chapterChange', { spineIndex: nextFrame.spineIndex, direction: 'next', frame: nextFrame });
             this._emit('load', { spineIndex: nextFrame.spineIndex, doc: nextFrame.doc, frame: nextFrame });
         }
-        return this._emitRelocate('nextChapter');
+        return this._emitRelocate('nextChapter', source);
     }
 
     /**
      * 이전 챕터로 이동합니다. (기본: 첫 페이지 'start', 필요 시 { position: 'end' } 지정 가능)
      * @param {Object} [options={}]
      * @param {'start'|'end'} [options.position='start']
+     * @param {string} [options.source='api'] - 입력 출처 식별자
      * @returns {Promise<Object|null>}
      */
     async prevChapter(options = {}) {
         const initialPosition = options.position === 'end' ? 'end' : 'start';
+        const source = options.source || 'api';
         const prevFrame = await this.slots.moveChapter('prev', { initialPosition });
         if (prevFrame) {
             prevFrame.syncViewportClipMask({ enabled: true });
             this._emit('chapterChange', { spineIndex: prevFrame.spineIndex, direction: 'prev', frame: prevFrame });
             this._emit('load', { spineIndex: prevFrame.spineIndex, doc: prevFrame.doc, frame: prevFrame });
         }
-        return this._emitRelocate('prevChapter');
+        return this._emitRelocate('prevChapter', source);
     }
 
     /**
      * 현재 챕터 내 특정 0-based 페이지로 직접 이동하고 relocate 이벤트를 발행합니다.
      * @param {number} pageIndex
-     * @param {'instant'|'smooth'} [behavior]
+     * @param {'instant'|'smooth'|Object} [behaviorOrOptions]
+     * @param {Object} [extraOptions={}]
      * @returns {{ moved: boolean, currentPage: number, totalPages: number }|null}
      */
-    goToPage(pageIndex, behavior) {
+    goToPage(pageIndex, behaviorOrOptions, extraOptions = {}) {
         const frame = this.slots.getCurrentFrame();
         if (!frame || this._isDestroyed) return null;
-        const effectiveBehavior = behavior || this.layoutOptions.transition;
+        const isObj = behaviorOrOptions && typeof behaviorOrOptions === 'object';
+        const requestedBehavior = isObj ? behaviorOrOptions.behavior : behaviorOrOptions;
+        const source = (isObj ? behaviorOrOptions.source : extraOptions?.source) || 'api';
+        const effectiveBehavior = requestedBehavior || this.layoutOptions.transition;
         const res = frame.goToPage(pageIndex, effectiveBehavior);
         frame.syncViewportClipMask({ enabled: effectiveBehavior !== 'smooth' });
-        if (res?.moved) this._emitRelocate('goToPage');
+        if (res?.moved) this._emitRelocate('goToPage', source);
         return res;
     }
 
     /**
      * 현재 챕터의 마지막 페이지로 이동하고 relocate 이벤트를 발행합니다.
+     * @param {Object} [options={}]
+     * @param {string} [options.source='api']
      * @returns {{ moved: boolean, currentPage: number, totalPages: number }|null}
      */
-    goToEnd() {
+    goToEnd(options = {}) {
         const frame = this.slots.getCurrentFrame();
         if (!frame || this._isDestroyed) return null;
+        const source = options?.source || 'api';
         const res = frame.goToEnd();
         frame.syncViewportClipMask({ enabled: true });
-        if (res?.moved) this._emitRelocate('goToEnd');
+        if (res?.moved) this._emitRelocate('goToEnd', source);
         return res;
     }
 
     /**
      * 현재 챕터 내 특정 DOM Range 또는 Element 위치로 이동하고 relocate 이벤트를 발행합니다.
      * @param {Range|Element} target
-     * @param {'instant'|'smooth'} [behavior='instant']
+     * @param {'instant'|'smooth'|Object} [behaviorOrOptions='instant']
+     * @param {Object} [extraOptions={}]
      * @returns {{ success: boolean, currentPage: number, totalPages: number }|null}
      */
-    scrollToTarget(target, behavior = 'instant') {
+    scrollToTarget(target, behaviorOrOptions = 'instant', extraOptions = {}) {
         const frame = this.slots.getCurrentFrame();
         if (!frame || this._isDestroyed) return null;
+        const isObj = behaviorOrOptions && typeof behaviorOrOptions === 'object';
+        const behavior = isObj ? (behaviorOrOptions.behavior || 'instant') : (behaviorOrOptions || 'instant');
+        const source = (isObj ? behaviorOrOptions.source : extraOptions?.source) || 'api';
         const res = frame.scrollToTarget(target, behavior);
         frame.syncViewportClipMask({ enabled: behavior !== 'smooth' });
-        if (res?.success) this._emitRelocate('scrollToTarget');
+        if (res?.success) this._emitRelocate('scrollToTarget', source);
         return res;
     }
 
-    /** 픽셀 단위 스크롤 (마우스 휠 / 자동 스크롤 커스텀용 — 연속 스크롤 보장을 위해 하단 마스킹 해제) */
-    scrollByPixels(deltaPx, behavior = 'instant') {
+    /**
+     * 픽셀 단위 스크롤 (마우스 휠 / 터치 폴백 / 자동 스크롤용 — 연속 스크롤 보장을 위해 하단 마스킹 해제)
+     * @param {number} deltaPx - 이동할 픽셀 변화량
+     * @param {'instant'|'smooth'|Object} [behaviorOrOptions='instant'] - 전환 방식 또는 { behavior, source } 옵션
+     * @param {Object} [extraOptions={}] - { source } 추가 옵션
+     * @returns {{ moved: boolean, atBoundary: 'start'|'end'|null }}
+     */
+    scrollByPixels(deltaPx, behaviorOrOptions = 'instant', extraOptions = {}) {
         const frame = this.slots.getCurrentFrame();
         if (!frame) return { moved: false, atBoundary: null };
+        const isObj = behaviorOrOptions && typeof behaviorOrOptions === 'object';
+        const behavior = isObj ? (behaviorOrOptions.behavior || 'instant') : (behaviorOrOptions || 'instant');
+        const source = (isObj ? behaviorOrOptions.source : extraOptions?.source) || 'api';
         const res = frame.scrollByPixels(deltaPx, behavior);
         frame.syncViewportClipMask({ enabled: false });
-        if (res.moved) this._emitRelocate('scrollByPixels');
+        if (res.moved) this._emitRelocate('scrollByPixels', source);
         return res;
     }
 
-    /** 글자 줄 수 단위 스크롤 */
-    scrollByLines(lineCount = 1, behavior = 'instant') {
+    /**
+     * 글자 줄 수 단위 스크롤
+     * @param {number} [lineCount=1]
+     * @param {'instant'|'smooth'|Object} [behaviorOrOptions='instant']
+     * @param {Object} [extraOptions={}]
+     * @returns {{ moved: boolean, atBoundary: 'start'|'end'|null }}
+     */
+    scrollByLines(lineCount = 1, behaviorOrOptions = 'instant', extraOptions = {}) {
         const frame = this.slots.getCurrentFrame();
         const lineH = frame?.paginator?.metrics?.exactLineHeightPx || 24;
-        return this.scrollByPixels(Number(lineCount) * lineH, behavior);
+        return this.scrollByPixels(Number(lineCount) * lineH, behaviorOrOptions, extraOptions);
     }
 
     /**
@@ -783,7 +841,7 @@ export class EwbEngine {
         Object.assign(this.layoutOptions, normalized);
         this._syncContainerBackground();
         if (this.state === EngineState.ACTIVE) {
-            this.relayout();
+            this.relayout({ source: partialOptions.source || 'setLayoutOptions' });
         }
     }
 
@@ -834,14 +892,16 @@ export class EwbEngine {
         this._userCss = cssText || '';
         this.slots.forEachFrame((frame) => frame.setUserStyle(this._userCss));
         if (this.state === EngineState.ACTIVE) {
-            this.relayout();
+            this.relayout({ source: 'setUserCss' });
         }
     }
 
     /**
      * 현재 보고 있는 첫 줄 위치를 보존하며 활성·대기 슬롯을 재조판하고 onRelayout 훅을 발행합니다.
+     * @param {Object} [options={}]
+     * @param {string} [options.source='relayout']
      */
-    relayout() {
+    relayout(options = {}) {
         const frame = this.slots.getCurrentFrame();
         let anchorRange = null;
 
@@ -870,14 +930,17 @@ export class EwbEngine {
             layoutOptions: this.getLayoutOptions()
         }, { stopOnHandled: false });
 
-        this._emitRelocate('relayout');
+        this._emitRelocate('relayout', options?.source || 'relayout');
     }
 
     /**
      * 현재 독서 위치 스냅샷, 첫/끝 줄·문단/줄 수·여백·잘림 추적 로그 및 CFI를 산출하고 relocate 이벤트를 발행합니다.
+     * @param {string} [trigger='internal'] - 엔진 내부 실행 액션 식별자
+     * @param {string} [source='engine'] - 외부 호출자 / 입력 장치 식별자
+     * @returns {Object|null}
      * @private
      */
-    _emitRelocate(trigger = 'internal') {
+    _emitRelocate(trigger = 'internal', source = 'engine') {
         const loc = this.getCurrentLocation();
         if (!loc) return null;
 
@@ -894,15 +957,15 @@ export class EwbEngine {
         if (clip) {
             this._log.trace({
                 action: 'pageView',
-                caller: `EwbEngine:${trigger}`,
+                caller: `EwbEngine:${trigger}(${source})`,
                 state: `${this.layoutOptions.flow} ch=${loc.spineIndex} p=${loc.page + 1}/${loc.totalPages}`,
                 delta: `first="${firstText}" | last="${lastText}" | lines=${clip.visibleLineCount}(full=${clip.fullLineCount}), paragraphs=${clip.paragraphCount} | margins(T:${padT} B:${padB} L:${padL} R:${padR})`,
                 result: `topCut=${clip.topCutPx}px, rawBottomCut=${clip.rawBottomCutPx}px, masked=${clip.maskedBottomPx}px, visibleBottomCut=${clip.visibleBottomCutPx}px`
             });
         }
 
-        this.hookBus.emitSync('onRelocate', { ...loc, trigger }, { stopOnHandled: false });
-        this._emit('relocate', { ...loc, trigger });
+        this.hookBus.emitSync('onRelocate', { ...loc, trigger, source }, { stopOnHandled: false });
+        this._emit('relocate', { ...loc, trigger, source });
         return loc;
     }
 
